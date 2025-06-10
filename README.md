@@ -1,0 +1,2 @@
+# diffusion_policy_online_world_model_with_lookahead
+This is a play around repo to explore adding a world model to the action diffusion policy (which is model-free) to enable the policy to imagine an action trajectory online with a world model before taking the action (making it model-based). The world model allows the model to lookahead with a few diffusion policy action trajectories in parallel. 
