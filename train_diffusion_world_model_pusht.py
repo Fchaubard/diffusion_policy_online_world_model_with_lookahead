@@ -1,28 +1,34 @@
-# train_diffusion_world_model_pusht.py
-# This file trains a diffusion world model on the pusht environment to take in (St,At) -> (St+1 = the next image after taking action At from St, Rt+1 = the reward of the predicted St+1)  
-# We use a U-Net with a cross attention layer At x St features. It will save off and overwrite checkpoints with a checkpoint config.txt with a unique id per run.
+# train_video_diffusion_world_model_pusht.py
+# This file trains a video diffusion world model on the pusht environment to take in (St,At) -> (St+1:t+n) = the next n images after taking action At from St, Rt+1:t+n = the rewards from the env of the predicted St+1:t+n)  
+# We use a U-Net with a cross attention layer At x St features. It will save off and overwrite checkpoints and gifs with a checkpoint config.txt with a unique id per run in an /all_runs/ folder. 
 
 # TO RUN:
 # Need to git clone https://github.com/real-stanford/diffusion_policy.git
 # then need to conda activate robodiff
 # then you can run this file with something like:
 
-# python train_diffusion_world_model_pusht.py \
-# --pred_horizon 16 \
-# --obs_horizon 2 \
-# --action_horizon 8 \
-# --max_steps_pusht_environment 200 \
-# --device cuda:1 \
-# --unet_num_layers 2 \
-# --base 64 \
-# --heads 4 \
-# --batch_size 32 \
-# --num_diffusion_iters_action_policy 1000 \
-# --beta_noise_start 1e-4 \
-# --beta_noise_end 0.02 \
-# --lr 0.0002 \
-# --batches_per_episode 50 \
-# --save_every 100
+# python train_video_diffusion_world_model_pusht.py \
+          # --base 32 \
+          # --layers 4 \
+          # --T 100 \
+          # --lr 0.0001 \
+          # --microbatch 16 \
+          # --macrobatch 4 \
+          # --random_policy_pct 0.1 \
+          # --device cuda:0 \
+          # --dataset_device cuda:0 \
+          # --ckpt_dir ./all_runs/ \
+          # --val_every 10 \
+          # --episodes 100000000 \
+          # --num_diffusion_iters_action_policy 100 \
+          # --action_horizon 8 \
+          # --context_frames 3 \
+          # --pred_horizon 16 \
+          # --max_steps_env 200 \
+          # --heads 4 \
+          # --beta0 1e-4 \
+          # --betaT 2e-2 \
+          # --img_hw 96 96 
 
 
 
@@ -58,6 +64,8 @@ from skvideo.io import vwrite
 from IPython.display import Video
 import gdown
 import os
+
+import imageio.v2 as imageio   # ← new import
 
 # **Environment**
 positive_y_is_up: bool = False
@@ -474,6 +482,7 @@ class PushTEnv(gym.Env):
         self._seed = seed
         self.np_random = np.random.default_rng(seed)
 
+    # OLD API
     def _handle_collision(self, arbiter, space, data):
         self.n_contact_points += len(arbiter.contact_point_set.points)
 
@@ -542,8 +551,12 @@ class PushTEnv(gym.Env):
         self.goal_pose = np.array([256,256,np.pi/4])  # x, y, theta (in radians)
 
         # Add collision handeling
-        self.collision_handeler = self.space.add_collision_handler(0, 0)
-        self.collision_handeler.post_solve = self._handle_collision
+        # OLD API
+        # self.collision_handeler = self.space.add_collision_handler(0, 0)
+        # self.collision_handeler.post_solve = self._handle_collision
+        # NEW API
+        self.space.on_collision(0, 0, post_solve=self._handle_collision)
+        
         self.n_contact_points = 0
 
         self.max_score = 50 * 100
@@ -1970,7 +1983,7 @@ class PushTVideoDataset(Dataset):
 # ──────────────────────── trainer ────────────────────────────────────────────
 class VideoWorldModelTrainer:
     def __init__(self, model, lr, T, beta_0, beta_T,
-                 device, ckpt_dir, pred_horizon):
+                 device, ckpt_dir, pred_horizon, use_DDIM_scheduler=False):
         self.model  = model.to(device)
         self.opt    = torch.optim.AdamW(model.parameters(), lr=lr)
         self.dev    = device
@@ -1986,13 +1999,30 @@ class VideoWorldModelTrainer:
         self.sqrt_ab = self.ab.sqrt()                    # √α̅ₜ
         self.sqrt_1mab = (1.0 - self.ab).sqrt()          # √(1‑α̅ₜ)
 
+        self.T = T
+        self.use_ddim = use_DDIM_scheduler
+
         # full DDPM scheduler for inference sampling
         from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-        self.scheduler = DDPMScheduler(
-            num_train_timesteps=T,
-            beta_schedule="linear",
-            clip_sample=True,
-            prediction_type="epsilon")
+        from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+
+        if not self.use_ddim:
+           
+            self.scheduler = DDPMScheduler(
+                num_train_timesteps=T,
+                beta_schedule="linear",
+                clip_sample=True,
+                prediction_type="epsilon")
+        else:
+            
+            self.eta = 0.0  # Default to deterministic DDIM
+            self.scheduler = DDIMScheduler(
+                num_train_timesteps=T,
+                beta_schedule="linear",        # or "scaled_linear", "squaredcos_cap_v2", etc.
+                prediction_type="epsilon",     # "epsilon", "sample", or "v_prediction"
+                clip_sample=True,
+                set_alpha_to_one=False       
+            )
 
 
 
@@ -2007,6 +2037,8 @@ class VideoWorldModelTrainer:
         """
 
         dataset = PushTVideoDataset(args)
+        self.opt.zero_grad()
+            
         
         # 2. outer loop over episodes --------------------------------
         for ep_counter in range(1, args.episodes + 1):
@@ -2014,10 +2046,11 @@ class VideoWorldModelTrainer:
             if not overfit or ep_counter==1:
                 # (re)collect one episode of data
                 dataset.collect_new_episodes(1)
-                loader = DataLoader(dataset, batch_size=args.batch,
+                loader = DataLoader(dataset, batch_size=args.microbatch,
                                     shuffle=True, drop_last=True, pin_memory=True)
 
             self.model.train()
+        
             for step, (ctx, acts, gt_fut, gt_rew) in enumerate(loader, start=1):
                 B = ctx.size(0)
                 ctx, acts   = ctx.to(self.dev), acts.to(self.dev)
@@ -2046,20 +2079,44 @@ class VideoWorldModelTrainer:
 
                 eps_pred, r_pred, q_pred = self.model(ctx, acts, noisy_fut, t)
         
-                loss_denoise = F.l1_loss(eps_pred, noise)
-                # loss_denoise = F.mse_loss(eps_pred, noise)
+                # loss_denoise = F.l1_loss(eps_pred, noise)
+                # # loss_denoise = F.mse_loss(eps_pred, noise)
                 
-                loss_reward  = F.mse_loss(r_pred, gt_rew)
-                qual_lbl     = sqrt_ab.squeeze().view(B,1).expand(-1, self.pred_horizon)
-                loss_quality = F.mse_loss(q_pred, qual_lbl)
+                # loss_reward  = F.mse_loss(r_pred, gt_rew)
+                # qual_lbl     = sqrt_ab.squeeze().view(B,1).expand(-1, self.pred_horizon)
+                # loss_quality = F.mse_loss(q_pred, qual_lbl)
 
-                loss = loss_denoise + loss_reward + loss_quality
+                if args.min_snr_gamma > 0:
+                    ab_t   = self.ab[t]                         # shape (B,)
+                    snr    = ab_t / (1.0 - ab_t)                # SNR_i
+                    snr_weight = torch.where(
+                                snr > args.min_snr_gamma,
+                                args.min_snr_gamma / snr,
+                                torch.ones_like(snr)
+                             ).view(B, 1, 1, 1, 1)              # reshape for broadcast
+                else:
+                    snr_weight = 1.0
+                    
 
-                self.opt.zero_grad()
+                # ---------- weighted denoising loss --------------------------------
+                diff = torch.abs(eps_pred - noise)     # or (eps_pred - noise).pow(2) for MSE
+                loss_denoise = (snr_weight * diff).mean()      
+                # -------------------------------------------------------------------
+                
+                loss_reward  = F.mse_loss(r_pred, gt_rew)              # scalar
+                # qual_lbl     = sqrt_ab.squeeze().view(B,1).expand(-1, self.pred_horizon)
+                # loss_quality = F.mse_loss(q_pred, qual_lbl)            # scalar
+                qual_lbl = 0
+                loss_quality =  0
+                
+                loss = (loss_denoise + loss_reward + loss_quality ) / args.macrobatch
                 loss.backward()
-                self.opt.step()
-
                 
+                if step % args.macrobatch == 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.max_norm)
+
+                    self.opt.step()
+                    self.opt.zero_grad()                    
 
                 if step % 1 == 0:
                     print(f"Future frames range: [{gt_fut.min():.3f}, {gt_fut.max():.3f}]")
@@ -2072,7 +2129,8 @@ class VideoWorldModelTrainer:
 
             # validation / checkpoint --------------------------------
             if ep_counter % args.val_every == 0 and not overfit:
-                self.validate(ctx_orig, acts, gt_rew, ep_counter, samplesteps=self.T)
+                self.validate_with_gif(ctx_orig, acts, gt_rew, ep_counter, samplesteps=self.T)
+                # self.validate(ctx_orig, acts, gt_rew, ep_counter, samplesteps=self.T)
 
                 ckpt_path = os.path.join(self.ckpt_d, f"wm_ep{ep_counter:03d}.pt")
                 torch.save({"model": self.model.state_dict(),
@@ -2110,11 +2168,58 @@ class VideoWorldModelTrainer:
             out.append(fr[..., ::-1])  # RGB→BGR for vwrite
 
         if video_path is None:
-            video_path = f"val_{step:07d}.mp4"
+            video_path = os.path.join(self.ckpt_d, f"val_{step:07d}.mp4")
             
-        vwrite(os.path.join(self.ckpt_d, video_path),
+        vwrite(video_path,
                np.stack(out))
         print(f"[validate] video saved → {video_path}")
+
+    
+
+    # ---------------------------------------------------------------------------------
+    # validate w/ gif  –  convert ctx back to [0,1] before calling _sample;
+    #                 write readable video frames
+    # ---------------------------------------------------------------------------------
+    def validate_with_gif(self, raw_ctx, acts, gt_rew, step,
+                 samplesteps=None, gif_path=None, fps=8):
+        """
+        raw_ctx is the context batch *before* we multiplied by 2-1 in training
+        """
+        self.model.eval()
+        with torch.no_grad():
+            rgb_pred, r_pred, q_pred = self._sample(
+                raw_ctx, acts, steps=samplesteps
+            )
+    
+        # rgb_pred  (1,Th,3,H,W)  –> uint8 HWC
+        frames = (rgb_pred[0].cpu().numpy() * 255).astype(np.uint8)
+        frames = frames.transpose(0, 2, 3, 1)       # (Th,H,W,3) RGB
+    
+        out_bgr = []
+        H, W = 512, 512
+        for i, fr in enumerate(frames):
+            fr = cv2.resize(fr, (W, H), interpolation=cv2.INTER_NEAREST)
+            # txt = f"r∗={gt_rew[0, i]:.2f}  r̂={r_pred[0, i]:.2f}  q̂={q_pred[0, i]:.2f}"
+            txt = f"r_gt={gt_rew[0, i]:.2f}  r_p={r_pred[0, i]:.2f}  q={q_pred[0, i]:.2f}"
+            cv2.putText(
+                fr, txt, (8, H - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                (255, 255, 255), 1, cv2.LINE_AA
+            )
+            out_bgr.append(fr[..., ::-1])            # → BGR (cv2 default)
+    
+        # ------------------------------------------------------------
+        # GIF-specific part
+        # ------------------------------------------------------------
+        if gif_path is None:
+            gif_path = os.path.join(self.ckpt_d, f"val_{step:07d}.gif")
+    
+        # Convert BGR → RGB for GIF writer
+        out_rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in out_bgr]
+    
+        # duration = seconds between frames
+        imageio.mimsave(gif_path, out_rgb, duration=1 / fps, loop=0)
+        print(f"[validate] GIF saved → {gif_path}")
     
     # ---------------------------------------------------------------------------------
     # _sample  –  fully normalise ctx/acts, start from correct x_T, and
@@ -2128,30 +2233,46 @@ class VideoWorldModelTrainer:
         returns   rgb_pred ∈ [0,1]
         """
         B, Tc, _, H, W = ctx.shape
-        ctx = ctx * 2 - 1                    # → [-1,1]   (matches training)
+        ctx = ctx * 2 - 1  # → [-1,1] to match training
     
-        # initialise x_T using scheduler helper so variance matches training
+        # initialize x_T with noise
         clean_zero = torch.zeros(
             B, self.pred_horizon, 3, H, W, device=self.dev)
-        noise      = torch.randn_like(clean_zero)
-        t_T        = torch.full((B,), self.scheduler.config.num_train_timesteps - 1,
-                                dtype=torch.long, device=self.dev)
+        noise = torch.randn_like(clean_zero)
+        t_T = torch.full((B,), self.scheduler.config.num_train_timesteps - 1,
+                         dtype=torch.long, device=self.dev)
         fut = self.scheduler.add_noise(clean_zero, noise, t_T)
     
-        # how many denoising steps?
+        # decide number of steps (DDIM or DDPM)
         if steps is None:
-            steps = self.scheduler.config.num_train_timesteps   # e.g. 400
+            steps = self.scheduler.config.num_train_timesteps
         self.scheduler.set_timesteps(steps)
     
         r_pred = q_pred = None
+    
+        # denoising loop
         for t in self.scheduler.timesteps:
             eps_pred, r_pred, q_pred = self.model(
                 ctx, acts, fut, torch.full((B,), t, device=self.dev))
-            fut = self.scheduler.step(eps_pred, t, fut).prev_sample
     
-        fut = fut.clamp(-1, 1)               # stay inside valid range
-        rgb = (fut + 1) / 2                  # → [0,1] for viz
+            if self.use_ddim:
+                fut = self.scheduler.step(
+                    model_output=eps_pred,
+                    timestep=t,
+                    sample=fut,
+                    eta=self.eta  # defaults to 0.0 for deterministic
+                ).prev_sample
+            else:
+                fut = self.scheduler.step(
+                    model_output=eps_pred,
+                    timestep=t,
+                    sample=fut
+                ).prev_sample
+    
+        fut = fut.clamp(-1, 1)
+        rgb = (fut + 1) / 2  # → [0,1] for visualization
         return rgb, r_pred, q_pred
+
 
 # ───────────────────────────── main ──────────────────────────────────────────
 if __name__ == "__main__":
@@ -2160,7 +2281,7 @@ if __name__ == "__main__":
     p.add_argument("--pred_horizon",  type=int, default=16)
     p.add_argument("--action_horizon",  type=int, default=8)
     p.add_argument("--context_frames",type=int, default=3)
-    p.add_argument("--max_steps_env", type=int, default=200)
+    p.add_argument("--max_steps_env", type=int, default=300)
     # ─── model ────────────────────────────────────────────────────────
     p.add_argument("--base",     type=int, default=64)
     p.add_argument("--layers",   type=int, default=4)
@@ -2171,18 +2292,21 @@ if __name__ == "__main__":
     p.add_argument("--beta0",    type=float, default=1e-4)
     p.add_argument("--betaT",    type=float, default=2e-2)
     # ─── train ────────────────────────────────────────────────────────
-    p.add_argument("--batch",    type=int, default=16)
+    p.add_argument("--microbatch",    type=int, default=16)
+    p.add_argument("--macrobatch",    type=int, default=1)
     p.add_argument("--lr",       type=float, default=5e-4)
     p.add_argument("--epochs",   type=int, default=10)
     p.add_argument("--val_every",type=int, default=10)
-    p.add_argument("--batches_per_episode",type=int, default=10)
     p.add_argument("--episodes",type=int, default=100000000)
     p.add_argument("--num_diffusion_iters_action_policy",type=int, default=100)
+    p.add_argument("--max_norm", type=float, default=1.0)
+    p.add_argument("--min_snr_gamma", type=float, default=5.0,
+                    help="γ in min-SNR loss weight (set ≤0 to disable)")
     
     p.add_argument("--device",   type=str,  default="cuda:0")
     p.add_argument("--ckpt_dir", type=str,  default="./checkpoints_and_videos")
 
-    p.add_argument("--random_policy_pct", type=float, default=0.0,
+    p.add_argument("--random_policy_pct", type=float, default=0.3,
                help="0 ⇒ purely policy‑guided, 1 ⇒ purely random, 0.3 ⇒ 30 % random")
     p.add_argument("--dataset_device", type=str, default="cuda:0",
                help="GPU on which to run the diffusion policy during collection")
@@ -2190,6 +2314,7 @@ if __name__ == "__main__":
 
 
     args = p.parse_args()
+    print(args)
 
     # ─── save args ────────────────────────────────────────────────────
     os.makedirs(args.ckpt_dir, exist_ok=True)
