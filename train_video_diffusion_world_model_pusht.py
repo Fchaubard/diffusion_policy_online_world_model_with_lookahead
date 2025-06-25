@@ -1,5 +1,5 @@
 # train_video_diffusion_world_model_pusht.py
-# This file trains a video diffusion world model on the pusht environment to take in (St,At) -> (St+1:t+n) = the next n images after taking action At from St, Rt+1:t+n = the rewards from the env of the predicted St+1:t+n)  
+# This file trains a video diffusion world model on the pusht environment to take in (St,At) -> (St+1:t+n) = the next n images after taking action At from St, as well as predict: Rt+1:t+n = the rewards from the env of the predicted St+1:t+n, as well as predict the quality of its prediction per frame: Qt+1:t+n = a quality score per frame    
 # We use a U-Net with a cross attention layer At x St features. It will save off and overwrite checkpoints and gifs with a checkpoint config.txt with a unique id per run in an /all_runs/ folder. 
 
 # TO RUN:
@@ -66,6 +66,7 @@ import gdown
 import os
 
 import imageio.v2 as imageio   # ← new import
+
 
 # **Environment**
 positive_y_is_up: bool = False
@@ -482,6 +483,7 @@ class PushTEnv(gym.Env):
         self._seed = seed
         self.np_random = np.random.default_rng(seed)
 
+    # OLD API
     def _handle_collision(self, arbiter, space, data):
         self.n_contact_points += len(arbiter.contact_point_set.points)
 
@@ -550,8 +552,12 @@ class PushTEnv(gym.Env):
         self.goal_pose = np.array([256,256,np.pi/4])  # x, y, theta (in radians)
 
         # Add collision handeling
-        self.collision_handeler = self.space.add_collision_handler(0, 0)
-        self.collision_handeler.post_solve = self._handle_collision
+        # OLD API
+        # self.collision_handeler = self.space.add_collision_handler(0, 0)
+        # self.collision_handeler.post_solve = self._handle_collision
+        # NEW API
+        self.space.on_collision(0, 0, post_solve=self._handle_collision)
+        
         self.n_contact_points = 0
 
         self.max_score = 50 * 100
@@ -670,6 +676,7 @@ class PushTImageEnv(PushTEnv):
             self._get_obs()
 
         return self.render_cache
+
 
 
 
