@@ -59,6 +59,7 @@ from IPython.display import Video
 import gdown
 import os
 
+
 # **Environment**
 positive_y_is_up: bool = False
 """Make increasing values of y point upwards.
@@ -474,6 +475,7 @@ class PushTEnv(gym.Env):
         self._seed = seed
         self.np_random = np.random.default_rng(seed)
 
+    # OLD API
     def _handle_collision(self, arbiter, space, data):
         self.n_contact_points += len(arbiter.contact_point_set.points)
 
@@ -542,8 +544,12 @@ class PushTEnv(gym.Env):
         self.goal_pose = np.array([256,256,np.pi/4])  # x, y, theta (in radians)
 
         # Add collision handeling
-        self.collision_handeler = self.space.add_collision_handler(0, 0)
-        self.collision_handeler.post_solve = self._handle_collision
+        # OLD API
+        # self.collision_handeler = self.space.add_collision_handler(0, 0)
+        # self.collision_handeler.post_solve = self._handle_collision
+        # NEW API
+        self.space.on_collision(0, 0, post_solve=self._handle_collision)
+        
         self.n_contact_points = 0
 
         self.max_score = 50 * 100
@@ -662,6 +668,8 @@ class PushTImageEnv(PushTEnv):
             self._get_obs()
 
         return self.render_cache
+
+
 
 
 
