@@ -4,7 +4,7 @@
 # 1. kill previous screens so the slate is clean
 screen -ls | awk '/\t/{print $1}' | xargs -r -I{} screen -S {} -X quit
 
-SCRIPT="train_video_world_model.py"
+SCRIPT="train_video_diffusion_world_model_pusht.py"
 ROOT_CKP="./all_runs"          # parent folder for every run
 mkdir -p "$ROOT_CKP"
 
