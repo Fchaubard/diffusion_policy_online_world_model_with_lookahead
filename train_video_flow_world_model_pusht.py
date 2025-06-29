@@ -2,11 +2,6 @@
 # This file trains a video flow world model on the pusht environment to take in (St,At) -> (St+1:t+n) = the next n images after taking action At from St, Rt+1:t+n = the rewards from the env of the predicted St+1:t+n)  
 # We use a U-Net with a cross attention layer At x St features. It will save off and overwrite checkpoints and gifs with a checkpoint config.txt with a unique id per run in an /all_runs/ folder. 
 
-# TO RUN:
-# Need to git clone https://github.com/real-stanford/diffusion_policy.git
-# then need to conda activate robodiff
-# then you can run this file with something like:
-
 # python train_video_flow_world_model_pusht.py \
           # --base 32 \
           # --layers 4 \
@@ -36,6 +31,7 @@
 # diffusion policy imports
 
 from typing import Tuple, Sequence, Dict, Union, Optional, Callable
+import glob, re, json, os, sys
 import numpy as np
 import math
 import torch
@@ -43,6 +39,8 @@ import torch.nn as nn
 import torchvision
 import collections
 import zarr
+from datetime import datetime
+
 
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.training_utils import EMAModel
@@ -64,7 +62,7 @@ from skvideo.io import vwrite
 from IPython.display import Video
 import gdown
 import os
-
+from itertools import islice
 import imageio.v2 as imageio   # ← new import
 
 
@@ -1790,7 +1788,7 @@ class PushTVideoDataset(Dataset):
     # ==============================================================
     # constructor
     # ==============================================================
-    def __init__(self, args):
+    def __init__(self, args, max_eps=1_000):
         super().__init__()
 
         # ------------ keep args ------------------------------------
@@ -1799,6 +1797,7 @@ class PushTVideoDataset(Dataset):
         # ------------ env -----------------------------------------
         from_environment = {}       # avoids circular imports
         self.env = PushTImageEnv(render_size=args.img_hw[0])
+        self.max_eps = max_eps
 
         # ------------ horizons ------------------------------------
         self.ctx = args.context_frames
@@ -1980,17 +1979,23 @@ class PushTVideoDataset(Dataset):
 
         self.episodes.append(dict(images=imgs, actions=acts,
                                   rewards=rews, valid=valid))
+        if len(self.episodes) > self.max_eps:
+            # drop oldest so we do not grow unbounded.
+            old = self.episodes.pop(0)
+            del old 
+        
 
 
 # ──────────────────────── trainer ────────────────────────────────────────────
 class VideoWorldModelTrainer:
     def __init__(self, model, lr, T, beta_0, beta_T,
-                 device, ckpt_dir, pred_horizon, use_DDIM_scheduler=False):
+                 device, ckpt_dir, pred_horizon, use_DDIM_scheduler=False, episode_start_counter=0):
         self.model  = model.to(device)
         self.opt    = torch.optim.AdamW(model.parameters(), lr=lr)
         self.dev    = device
         self.ckpt_d = ckpt_dir
         os.makedirs(self.ckpt_d, exist_ok=True)
+        self.episode_start_counter = episode_start_counter
 
         self.pred_horizon = pred_horizon
 
@@ -2030,6 +2035,7 @@ class VideoWorldModelTrainer:
 
 
 
+    
     # ------------------------------------------------------------------
     def train(self, args, overfit=False):
         """
@@ -2040,20 +2046,21 @@ class VideoWorldModelTrainer:
 
         dataset = PushTVideoDataset(args)
         self.opt.zero_grad()
-            
-        
-        # 2. outer loop over episodes --------------------------------
-        for ep_counter in range(1, args.episodes + 1):
 
-            if not overfit or ep_counter==1:
+        total_steps = 0
+        max_steps_per_collection = args.macrobatch * args.steps_per_episode_collection
+        # 2. outer loop --------------------------------
+        for ep_counter in range(self.episode_start_counter+1,100000000):
+
+            if not overfit or ep_counter==self.episode_start_counter+1:
                 # (re)collect one episode of data
-                dataset.collect_new_episodes(1)
+                dataset.collect_new_episodes(args.episodes)
                 loader = DataLoader(dataset, batch_size=args.microbatch,
                                     shuffle=True, drop_last=True, pin_memory=True)
 
             self.model.train()
-        
-            for step, (ctx, acts, gt_fut, gt_rew) in enumerate(loader, start=1):
+
+            for step, (ctx, acts, gt_fut, gt_rew) in enumerate(islice(loader, max_steps_per_collection), start=1):
                 B = ctx.size(0)
                 ctx, acts   = ctx.to(self.dev), acts.to(self.dev)
                 gt_fut, gt_rew = gt_fut.to(self.dev), gt_rew.to(self.dev)
@@ -2091,8 +2098,12 @@ class VideoWorldModelTrainer:
                     
 
                 # ---------- weighted denoising loss --------------------------------
-                diff = torch.abs(v_pred - v_target)     # or (v_pred - noise).pow(2) for MSE
-                loss_denoise = (diff).mean()      
+                # diff = torch.abs(v_pred - v_target)     # or (v_pred - noise).pow(2) for MSE
+                # diff = (v_pred - v_target).pow(2)
+                # loss_denoise = (diff).mean()
+                # or
+                loss_denoise = F.mse_loss(v_pred, v_target)
+                      
                 # -------------------------------------------------------------------
                 
                 loss_reward  = F.mse_loss(r_pred, gt_rew)              # scalar
@@ -2108,16 +2119,16 @@ class VideoWorldModelTrainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.max_norm)
 
                     self.opt.step()
-                    self.opt.zero_grad()                    
+                    self.opt.zero_grad()   
+                    total_steps+=1
 
-                if step % 1 == 0:
+                # if step % 1 == 0:
                     print(f"Future frames range: [{gt_fut.min():.3f}, {gt_fut.max():.3f}]")
                     print(f"Noise pred range: [{v_pred.min():.3f}, {v_pred.max():.3f}]")
                     print(f"True noise range: [{noise.min():.3f}, {noise.max():.3f}]")
-    
-                    print(f"[ep {ep_counter} step {step}] "
-                          f"L {loss:.4f} | denoise {loss_denoise:.4f} "
-                          f"| rew {loss_reward:.4f} | q {loss_quality:.4f}")
+
+                    time_now = datetime.now().strftime("%H:%M:%S")
+                    print(f"[t {time_now} | total {total_steps} | ep {ep_counter} | step {step}] L {loss:.4f} | denoise {loss_denoise:.4f} | rew {loss_reward:.4f} | q {loss_quality:.4f}")
 
             # validation / checkpoint --------------------------------
             if ep_counter % args.val_every == 0 and not overfit:
@@ -2128,8 +2139,6 @@ class VideoWorldModelTrainer:
                 torch.save({"model": self.model.state_dict(),
                             "opt":   self.opt.state_dict()}, ckpt_path)
                 print(f"[ep {ep_counter}] checkpoint saved → {ckpt_path}")
-
-
 
 
     # ---------------------------------------------------------------------------------
@@ -2217,7 +2226,8 @@ if __name__ == "__main__":
     p.add_argument("--lr",       type=float, default=5e-4)
     p.add_argument("--epochs",   type=int, default=10)
     p.add_argument("--val_every",type=int, default=10)
-    p.add_argument("--episodes",type=int, default=100000000)
+    p.add_argument("--episodes",type=int, default=1)
+    p.add_argument("--steps_per_episode_collection",type=int, default=100)
     p.add_argument("--num_diffusion_iters_action_policy",type=int, default=100)
     p.add_argument("--max_norm", type=float, default=1.0)
     p.add_argument("--min_snr_gamma", type=float, default=5.0,
@@ -2236,10 +2246,6 @@ if __name__ == "__main__":
     args = p.parse_args()
     print(args)
 
-    # ─── save args ────────────────────────────────────────────────────
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    with open(os.path.join(args.ckpt_dir, "hparams.json"), "w") as f:
-        json.dump(vars(args), f, indent=2)
 
     # ─── model / trainer ─────────────────────────────────────────────
     model = VideoActionConditionedUNet(
@@ -2252,10 +2258,45 @@ if __name__ == "__main__":
         img_resolution=tuple(args.img_hw))   # <-- 96×96 from CLI
 
     
+    
+    # ─── check for prev checkpoint ───────────────────────────────────────────────
+    ckpt_re   = re.compile(r"wm_ep(\d+)\.pt$")
+    latest_ckpt = None
+    last_ep      = -1
+    
+    if os.path.isdir(args.ckpt_dir):
+        for p in glob.glob(os.path.join(args.ckpt_dir, "wm_ep*.pt")):
+            m = ckpt_re.search(os.path.basename(p))
+            if m:
+                ep = int(m.group(1))
+                if ep > last_ep:
+                    last_ep, latest_ckpt = ep, p
+    
+    if latest_ckpt is not None:
+        # ── resume ──────────────────────────────────────────────────────────
+        print(f"\n\033[92m▶ Resuming from {latest_ckpt} "
+              f"(episode {last_ep})\033[0m\n", file=sys.stderr)
+    
+        state = torch.load(latest_ckpt, map_location="cpu")
+        model.load_state_dict(state["model"], strict=False)      # restore weights
+        # resume_opt_state = state.get("opt", None)                # may be used later
+        del state
+        episode_start_counter = last_ep + 1
+    else:
+        # ── fresh run ───────────────────────────────────────────────────────
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+        with open(os.path.join(args.ckpt_dir, "hparams.json"), "w") as f:
+            json.dump(vars(args), f, indent=2)
+        resume_opt_state      = None
+        episode_start_counter = 0
+
+
+
     trainer = VideoWorldModelTrainer(
         model, args.lr, args.T, args.beta0, args.betaT,
         args.device, args.ckpt_dir,
-        pred_horizon=args.pred_horizon)
+        pred_horizon=args.pred_horizon, 
+        episode_start_counter=episode_start_counter)
 
     # ─── run ─────────────────────────────────────────────────────────
     trainer.train(args)
