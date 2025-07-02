@@ -2,6 +2,11 @@
 # This file trains a video flow world model on the pusht environment to take in (St,At) -> (St+1:t+n) = the next n images after taking action At from St, Rt+1:t+n = the rewards from the env of the predicted St+1:t+n)  
 # We use a U-Net with a cross attention layer At x St features. It will save off and overwrite checkpoints and gifs with a checkpoint config.txt with a unique id per run in an /all_runs/ folder. 
 
+# TO RUN:
+# Need to git clone https://github.com/real-stanford/diffusion_policy.git
+# then need to conda activate robodiff
+# then you can run this file with something like:
+
 # python train_video_flow_world_model_pusht.py \
           # --base 32 \
           # --layers 4 \
@@ -323,6 +328,7 @@ class PushTEnv(gym.Env):
         self.reset_to_state = reset_to_state
 
     def reset(self):
+
         seed = self._seed
         self._setup()
         if self.block_cog is not None:
@@ -330,7 +336,27 @@ class PushTEnv(gym.Env):
         if self.damping is not None:
             self.space.damping = self.damping
 
-        # use legacy RandomState for compatiblity
+
+        # rs = np.random.RandomState(seed=seed)
+    
+        # # NEW: randomise goal BEFORE you randomise block/agent, or as you prefer
+        # self.goal_pose = np.array([
+        #     rs.randint( 50, 450),      # x
+        #     rs.randint( 50, 450),      # y
+        #     rs.uniform(-np.pi, np.pi)  # θ
+        # ])
+    
+        # # keep the existing randomisation for agent & block
+        # state = np.array([
+        #     rs.randint(50, 450), rs.randint(50, 450),
+        #     rs.randint(100, 400), rs.randint(100, 400),
+        #     rs.randn() * 2*np.pi - np.pi
+        # ])
+        # self._set_state(state)
+
+
+        
+        # OLD: use legacy RandomState for compatiblity
         state = self.reset_to_state
         if state is None:
             rs = np.random.RandomState(seed=seed)
@@ -1498,6 +1524,505 @@ class ActionConditionedUNet(nn.Module):
 
 
 
+
+########### RNNVideoActionConditionedUNet Architecture ###################### 
+import math, torch, torch.nn as nn, torch.nn.functional as F
+def conv_gnsilu(cin, cout, k=3, s=1, p=1):
+    return nn.Sequential(
+        nn.Conv3d(cin, cout, k, s, p),
+        nn.GroupNorm(8, cout),
+        nn.SiLU(),
+    )
+    
+class SinusoidalPosEmb_RNN(nn.Module):
+    """Standard sinusoidal embedding (for diffusion/flow-matching timesteps)."""
+    def __init__(self, dim): super().__init__(); self.dim = dim
+    def forward(self, t):                       # t: (B,)
+        half = self.dim // 2
+        freqs = torch.exp(
+            torch.arange(half, device=t.device) *
+            -(math.log(10000.0) / (half - 1))
+        )
+        emb = t.float().unsqueeze(1) * freqs.unsqueeze(0)     # (B, half)
+        return torch.cat([emb.sin(), emb.cos()], dim=-1)      # (B, dim)
+
+# ─────────────────── upgraded RNN UNet ──────────────────────
+class RNNVideoActionConditionedUNet(nn.Module):
+    """
+    Action-conditioned 3-D UNet **with GRU planner & FiLM**.
+
+    * Value / Quality heads come directly from GRU hidden states
+      (Linear → Transformer → 2-way Linear), so inference can bypass
+      the heavy decoder if only scalars are needed.
+
+    Public API unchanged from the original VideoActionConditionedUNet.
+    """
+
+    # ─────────────────────────────────────────────────────────
+    def __init__(self,
+                 pred_horizon,            # Th
+                 context_frames=3,        # Tc
+                 action_dim=2,            # D
+                 base_channels=8,         # C0
+                 num_layers=4,            # requested depth (≥3)
+                 num_heads=4,             # attn heads
+                 img_resolution=(96, 96),
+                 action_emb_dim=32):
+        super().__init__()
+
+        # ---------- hyper-params ----------
+        self.Th  = pred_horizon
+        self.Tc  = context_frames
+        self.D   = action_dim
+        self.dA  = action_emb_dim
+        self.H, self.W = img_resolution
+        assert self.H >= 8 and self.W >= 8, "Input resolution must be ≥ 8×8"
+
+        # ---------- action embed ----------
+        self.action_mlp = nn.Sequential(
+            nn.Linear(action_dim, action_emb_dim),
+            nn.SiLU(),
+            nn.Linear(action_emb_dim, action_emb_dim),
+        )
+
+        # ---------- timestep embed ----------
+        tdim = base_channels * 4
+        self.time_emb = nn.Sequential(
+            SinusoidalPosEmb_RNN(base_channels),
+            nn.Linear(base_channels, tdim),
+            nn.SiLU(),
+            nn.Linear(tdim, base_channels),
+        )
+
+        # ---------- stem ----------
+        in_C = 3 + action_emb_dim
+        self.stem = conv_gnsilu(in_C, base_channels)
+        ch = base_channels
+
+        # ---------- encoder (auto-stop at 8×8) ----------
+        self.down, self.pool, self.skip_ch = nn.ModuleList(), nn.ModuleList(), []
+        cur_h, cur_w = self.H, self.W
+        for _ in range(1, max(3, num_layers)):          # at least 3 downs
+            out_c = ch * 2
+            self.down.append(conv_gnsilu(ch, out_c))
+
+            # stride-2 only if next spatial ≥ 8×8
+            if min(cur_h // 2, cur_w // 2) >= 8:
+                k, s, p = (1,4,4), (1,2,2), (0,1,1)
+                cur_h //= 2; cur_w //= 2
+            else:
+                k, s, p = (1,3,3), (1,1,1), (0,1,1)
+            self.pool.append(nn.Conv3d(out_c, out_c, k, s, p))
+
+            self.skip_ch.append(out_c)
+            ch = out_c
+
+        # ---------- bottleneck ----------
+        self.bottleneck_conv = conv_gnsilu(ch, ch)
+
+        # GRU planner (batch_first=True → (B,T,*))
+        self.gru = nn.GRU(input_size = ch + action_emb_dim,
+                          hidden_size = ch,
+                          num_layers  = 1,
+                          batch_first = True)
+        self.film_fc = nn.Linear(ch, ch * 2)    # → γ, β
+
+        # ---------- deep value / quality heads ----------
+        red_dim = max(num_heads, (ch // 2 // num_heads) * num_heads)
+        self.deep_reduce = nn.Linear(ch, red_dim)
+        deep_tx_layer = nn.TransformerEncoderLayer(
+            d_model         = red_dim,
+            nhead           = num_heads,
+            dim_feedforward = red_dim * 4,
+            batch_first     = False)
+        self.deep_tx   = nn.TransformerEncoder(deep_tx_layer, num_layers=1)
+        self.deep_head = nn.Linear(red_dim, 2)           # → value, quality
+
+        # ---------- decoder ----------
+        self.up, self.up_t = nn.ModuleList(), nn.ModuleList()
+        for skip_c in reversed(self.skip_ch):
+            self.up_t.append(
+                nn.ConvTranspose3d(ch, skip_c,
+                                   (1,4,4), (1,2,2), (0,1,1)))
+            self.up.append(conv_gnsilu(skip_c * 2, skip_c))
+            ch = skip_c
+
+        self.up_t.append(
+            nn.ConvTranspose3d(ch, base_channels,
+                               (1,4,4), (1,2,2), (0,1,1)))
+        self.up.append(conv_gnsilu(base_channels * 2, base_channels))
+        ch = base_channels
+
+        # ---------- pixel head ----------
+        self.final_conv = nn.Conv3d(ch, 3, 3, 1, 1)
+        nn.init.zeros_(self.final_conv.bias)
+
+    # ────────────────────────── forward ─────────────────────────
+    def forward(self, context_frames, actions, noisy_future, timesteps):
+        """
+        context_frames : (B, Tc, 3, H, W)
+        actions        : (B, Th, D)      ← time-major
+        noisy_future   : (B, Th, 3, H, W)
+        timesteps      : (B,)
+        """
+        B, Tc, _, H, W = context_frames.shape
+        Th, dA = self.Th, self.dA
+        dev = context_frames.device
+
+        # ------ action embedding (B,Th,dA) ------
+        act_emb = self.action_mlp(actions)                 # (B,Th,dA)
+
+        # build volume (B,dA,Th,H,W)
+        act_vol = act_emb.transpose(1,2).unsqueeze(-1).unsqueeze(-1) \
+                         .expand(-1, -1, -1, H, W)
+
+        # ------ assemble input volume -----------
+        x = torch.zeros(B, 3 + dA, Tc + Th, H, W, device=dev)
+        x[:, :3, :Tc] = context_frames.permute(0,2,1,3,4)
+        x[:, :3, Tc:] = noisy_future.permute(0,2,1,3,4)
+        x[:, 3:, Tc:] = act_vol
+
+        # ------ time embedding ------------------
+        t_emb = self.time_emb(timesteps).view(B,-1,1,1,1)
+
+        # ------ stem ----------------------------
+        x = self.stem(x) + t_emb
+        stem_skip = x
+
+        # ------ encoder -------------------------
+        skips = []
+        for down, pool in zip(self.down, self.pool):
+            x = down(x); skips.append(x); x = pool(x)
+
+        # ------ bottleneck conv -----------------
+        x = self.bottleneck_conv(x)
+        if x.size(1) != t_emb.size(1):
+            t_big = t_emb.repeat(1, x.size(1)//t_emb.size(1),1,1,1)
+        else:
+            t_big = t_emb
+        x = x + t_big
+
+        # ------ GRU planner + FiLM --------------
+        B_, C_, T_, h, w = x.shape
+        vis_pool = x.mean((-2,-1)).transpose(1,2)            # (B,T,C)
+        ctx_pad  = torch.zeros(B_, self.Tc, dA, device=dev)
+        act_seq  = torch.cat([ctx_pad, act_emb], dim=1)       # (B,T,dA)
+        gru_in   = torch.cat([vis_pool, act_seq], dim=-1)     # (B,T,C+dA)
+        gru_out, _ = self.gru(gru_in)                         # (B,T,C)
+
+        gamma, beta = self.film_fc(gru_out).chunk(2, dim=-1)  # each (B,T,C)
+        gamma = gamma.transpose(1,2).unsqueeze(-1).unsqueeze(-1)
+        beta  = beta .transpose(1,2).unsqueeze(-1).unsqueeze(-1)
+        x = gamma * x + beta
+
+        # ===== deep heads (value / quality) =====
+        deep = self.deep_reduce(gru_out)                # (B,T,red_dim)
+        deep = deep.permute(1,0,2)                      # (T,B,red_dim) for Tx
+        deep = self.deep_tx(deep)                       # (T,B,red_dim)
+        deep = self.deep_head(deep).permute(1,0,2)      # (B,T,2)
+        value_pred   = deep[:, self.Tc:, 0]             # (B,Th)
+        quality_pred = deep[:, self.Tc:, 1]             # (B,Th)
+
+        # ------ decoder (pixel path) ------------
+        for up_t, blk in zip(self.up_t[:-1], self.up[:-1]):
+            x = up_t(x)
+            skip = skips.pop()
+            dh, dw = skip.shape[-2]-x.shape[-2], skip.shape[-1]-x.shape[-1]
+            if dh or dw:
+                x = F.pad(x,(dw//2, dw-dw//2, dh//2, dh-dh//2))
+            x = blk(torch.cat([x, skip], dim=1))
+
+        x = self.up_t[-1](x)
+        dh, dw = stem_skip.shape[-2]-x.shape[-2], stem_skip.shape[-1]-x.shape[-1]
+        if dh or dw:
+            x = F.pad(x,(dw//2, dw-dw//2, dh//2, dh-dh//2))
+        x = self.up[-1](torch.cat([x, stem_skip], dim=1))
+
+        eps = self.final_conv(x)[:, :, Tc:]              # (B,3,Th,H,W)
+        eps = eps.permute(0,2,1,3,4)                     # (B,Th,3,H,W)
+        return eps, value_pred, quality_pred
+
+    # -----------------------------------------------------------
+    @torch.no_grad()
+    def predict_value_quality(self, ctx_frames, actions, timesteps):
+        """Fast scalar inference (encoder + GRU only)."""
+        dummy_future = torch.zeros(
+            ctx_frames.size(0), self.Th, 3, self.H, self.W,
+            device=ctx_frames.device, dtype=ctx_frames.dtype)
+        _, v, q = self.forward(ctx_frames, actions, dummy_future, timesteps)
+        return v, q
+
+
+
+
+
+########### AccumVideoActionConditionedUNet Architecture ###################### 
+import math, torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SinusoidalPosEmb_Accum(nn.Module):
+    """1-D sinusoidal embedding for diffusion / flow-matching timesteps."""
+    def __init__(self, dim: int):
+        super().__init__(); self.dim = dim
+    def forward(self, t):                      # t: (B,) float / int
+        half = self.dim // 2
+        freqs = torch.exp(
+            torch.arange(half, device=t.device) *
+            -(math.log(10000.0) / (half - 1))
+        )
+        emb = t.float().unsqueeze(1) * freqs.unsqueeze(0)     # (B, half)
+        return torch.cat([emb.sin(), emb.cos()], dim=-1)      # (B, dim)
+
+# ───────────────────── main model ───────────────────────────
+class AccumVideoActionConditionedUNet(nn.Module):
+    """
+    Action-conditioned video UNet **with rolling-sum action channels**.
+    Value & Quality heads come *directly* from the bottleneck volume
+    (MLP → Transformer → MLP) so inference can skip the expensive decoder.
+
+    Args (unchanged from original VideoActionConditionedUNet)
+    ---------------------------------------------------------
+    pred_horizon    : int   # Th    (# future frames to predict)
+    context_frames  : int   # Tc    (# past frames given)
+    action_dim      : int   # D     (length of per-timestep action vector)
+    base_channels   : int   # C₀    (UNet width at full resolution)
+    num_layers      : int   # requested depth ≥3 (will be trimmed if spatial <8)
+    num_heads       : int   # attn heads in both Transformers
+    img_resolution  : (H,W)
+    action_emb_dim  : int   # learned embedding channels for each action step
+
+    Forward  (identical signature)
+    -------
+    (context_frames, actions, noisy_future, timesteps) →
+
+        eps        : (B, Th, 3, H, W)   — diffusion noise / flow residual
+        value_pred : (B, Th)            — scalar value per future step
+        qual_pred  : (B, Th)            — scalar “quality” per future step
+
+    Inference-time shortcut
+    -----------------------
+    ``value, quality = model.predict_value_quality(context_frames, actions, timesteps)``
+    runs only encoder + bottleneck (no decoder) for speed.
+    """
+    # ────────────────────────────────────────────────────────
+    def __init__(self,
+                 pred_horizon,
+                 context_frames=3,
+                 action_dim=2,
+                 base_channels=8,
+                 num_layers=4,
+                 num_heads=4,
+                 img_resolution=(96, 96),
+                 action_emb_dim=32):
+        super().__init__()
+        # ---------- params ----------
+        self.pred_horizon   = pred_horizon
+        self.context_frames = context_frames
+        self.action_dim     = action_dim
+        self.dA             = action_emb_dim
+        self.H, self.W      = img_resolution
+        assert self.H >= 8 and self.W >= 8, "Input resolution must be ≥ 8×8"
+
+        # ---------- action embedding (2·D → dA) ----------
+        self.action_mlp = nn.Sequential(
+            nn.Linear(2 * action_dim, action_emb_dim),
+            nn.SiLU(),
+            nn.Linear(action_emb_dim, action_emb_dim)
+        )
+
+        # ---------- timestep embedding ----------
+        t_dim = base_channels * 4
+        self.time_emb = nn.Sequential(
+            SinusoidalPosEmb_Accum(base_channels),
+            nn.Linear(base_channels, t_dim),
+            nn.SiLU(),
+            nn.Linear(t_dim, base_channels)
+        )
+
+        # ---------- stem ----------
+        in_C = 3 + action_emb_dim
+        self.stem = conv_gnsilu(in_C, base_channels)
+        ch = base_channels
+
+        # ---------- encoder (auto-stops at 8×8) ----------
+        self.down, self.pool, self.skip_ch = nn.ModuleList(), nn.ModuleList(), []
+        cur_h, cur_w = self.H, self.W
+        for _ in range(1, max(3, num_layers)):     # at least 3 downs
+            out_c = ch * 2
+            self.down.append(conv_gnsilu(ch, out_c))
+
+            # stride-2 only if next spatial ≥8, else stride-1
+            if min(cur_h // 2, cur_w // 2) >= 8:
+                stride, k, p = (1, 2, 2), (1, 4, 4), (0, 1, 1)
+                cur_h //= 2; cur_w //= 2
+            else:                                  # keep 8×8 or larger
+                stride, k, p = (1, 1, 1), (1, 3, 3), (0, 1, 1)
+
+            self.pool.append(nn.Conv3d(out_c, out_c, k, stride, p))
+            self.skip_ch.append(out_c)
+            ch = out_c
+
+        # ---------- bottleneck ----------
+        self.bottleneck_conv = conv_gnsilu(ch, ch)
+        tx_layer = nn.TransformerEncoderLayer(
+            d_model          = ch,
+            nhead            = num_heads,
+            dim_feedforward  = ch * 4,
+            batch_first      = False)
+        self.transformer = nn.TransformerEncoder(tx_layer, num_layers=1)
+
+        # ── value / quality heads (from bottleneck) ──
+        red_dim = max(num_heads, (ch // 2 // num_heads) * num_heads)  # ensure ÷heads
+        self.deep_reduce = nn.Linear(ch, red_dim)
+        deep_tx_layer = nn.TransformerEncoderLayer(
+            d_model          = red_dim,
+            nhead            = num_heads,
+            dim_feedforward  = red_dim * 4,
+            batch_first      = False)
+        self.deep_tx   = nn.TransformerEncoder(deep_tx_layer, num_layers=1)
+        self.deep_head = nn.Linear(red_dim, 2)        # → value, quality
+
+        # ---------- decoder (unchanged) ----------
+        self.up, self.up_t = nn.ModuleList(), nn.ModuleList()
+        for skip_c in reversed(self.skip_ch):
+            self.up_t.append(
+                nn.ConvTranspose3d(ch, skip_c,
+                                   (1,4,4), (1,2,2), (0,1,1)))
+            self.up.append(conv_gnsilu(skip_c * 2, skip_c))
+            ch = skip_c
+
+        self.up_t.append(
+            nn.ConvTranspose3d(ch, base_channels,
+                               (1,4,4), (1,2,2), (0,1,1)))
+        self.up.append(conv_gnsilu(base_channels * 2, base_channels))
+        ch = base_channels
+
+        # ---------- pixel head ----------
+        self.final_conv = nn.Conv3d(ch, 3, 3, 1, 1)
+        nn.init.zeros_(self.final_conv.bias)
+
+    # ────────────────────────── forward ─────────────────────────
+    def forward(self, context_frames, actions, noisy_future, timesteps):
+    #     """
+    #     context_frames : (B, Tc, 3, H, W)
+    #     actions        : (B, D, Th)
+    #     noisy_future   : (B, Th, 3, H, W)
+    #     timesteps      : (B,)
+    #     """
+    #     B, Tc, _, H, W = context_frames.shape
+    #     Th, D, dA = self.pred_horizon, self.action_dim, self.dA
+    #     dev = context_frames.device
+
+    #     # ----- build augmented action tensor -----
+    #     actions_accum = torch.cumsum(actions, dim=2)           # (B,D,Th)
+    #     act_cat = torch.cat([actions, actions_accum], dim=1)   # (B,2D,Th)
+    #     act_emb = self.action_mlp(act_cat.permute(0, 2, 1))    # (B,Th,dA)
+
+    #     act_vol = act_emb.transpose(1, 2).unsqueeze(-1).unsqueeze(-1) \
+    #                       .expand(-1, -1, -1, H, W)            # (B,dA,Th,H,W)
+
+        B, Tc, _, H, W = context_frames.shape
+        Th, D, dA = self.pred_horizon, self.action_dim, self.dA
+        dev = context_frames.device
+    
+        # 1) rolling-sum over the *time* axis (=1)
+        actions_accum = torch.cumsum(actions, dim=1)          # (B,Th,D)
+    
+        # 2) concat along feature dim (=-1)  →  (B,Th,2D)
+        act_cat = torch.cat([actions, actions_accum], dim=-1) # (B,Th,2D)
+    
+        # 3) embed: (B,Th,2D) → (B,Th,dA)  (no permute needed)
+        act_emb = self.action_mlp(act_cat)
+    
+        # 4) build action volume  (B,dA,Th,H,W)
+        act_vol = act_emb.transpose(1, 2).unsqueeze(-1).unsqueeze(-1) \
+                         .expand(-1, -1, -1, H, W)
+
+        # ----- input volume -----
+        x = torch.zeros(B, 3 + dA, Tc + Th, H, W, device=dev)
+        x[:, :3, :Tc] = context_frames.permute(0, 2, 1, 3, 4)
+        x[:, :3, Tc:] = noisy_future.permute(0, 2, 1, 3, 4)
+        x[:, 3:, Tc:] = act_vol                                  # embed channels
+
+        # ----- time embedding -----
+        t_emb = self.time_emb(timesteps).view(B, -1, 1, 1, 1)
+
+        # ----- stem -----
+        x = self.stem(x) + t_emb
+        stem_skip = x
+
+        # ----- encoder -----
+        skips = []
+        for down, pool in zip(self.down, self.pool):
+            x = down(x); skips.append(x); x = pool(x)
+
+        # ----- bottleneck -----
+        x = self.bottleneck_conv(x)
+        if x.size(1) != t_emb.size(1):
+            t_big = t_emb.repeat(1, x.size(1) // t_emb.size(1), 1, 1, 1)
+        else:
+            t_big = t_emb
+        x = x + t_big
+
+        # time-only transformer (same as before)
+        B_, C_, T_, h, w = x.shape
+        seq = x.mean((-1, -2)).permute(2, 0, 1)       # (T,B,C)
+        seq = self.transformer(seq)
+        x   = x + seq.permute(1, 2, 0).unsqueeze(-1).unsqueeze(-1)
+
+        # ===== deep value / quality head =====
+        deep = x.mean((-1, -2)).permute(2, 0, 1)       # (T,B,C)
+        deep = self.deep_reduce(deep)                  # (T,B,red_dim)
+        deep = self.deep_tx(deep)                      # (T,B,red_dim)
+        deep = self.deep_head(deep)                    # (T,B,2)
+        deep = deep.permute(1, 0, 2)                   # (B,T,2)
+
+        value_pred   = deep[:, Tc:, 0]                 # (B,Th)
+        quality_pred = deep[:, Tc:, 1]                 # (B,Th)
+
+        # ----- decoder (pixel path) -----
+        for up_t, blk in zip(self.up_t[:-1], self.up[:-1]):
+            x = up_t(x)
+            skip = skips.pop()
+            dh, dw = skip.shape[-2] - x.shape[-2], skip.shape[-1] - x.shape[-1]
+            if dh or dw:
+                x = F.pad(x, (dw // 2, dw - dw // 2, dh // 2, dh - dh // 2))
+            x = blk(torch.cat([x, skip], dim=1))
+
+        x = self.up_t[-1](x)
+        dh, dw = stem_skip.shape[-2] - x.shape[-2], stem_skip.shape[-1] - x.shape[-1]
+        if dh or dw:
+            x = F.pad(x, (dw // 2, dw - dw // 2, dh // 2, dh - dh // 2))
+        x = self.up[-1](torch.cat([x, stem_skip], dim=1))
+
+        eps = self.final_conv(x)[:, :, Tc:]            # (B,3,Th,H,W)
+        eps = eps.permute(0, 2, 1, 3, 4)               # (B,Th,3,H,W)
+        return eps, value_pred, quality_pred
+
+    # -----------------------------------------------------------
+    @torch.no_grad()
+    def predict_value_quality(self, context_frames, actions, timesteps):
+        """
+        Faster inference helper: runs *only* encoder & bottleneck to
+        output value / quality, skipping the heavy decoder.
+        """
+        B, Tc, _, H, W = context_frames.shape
+        Th = self.pred_horizon
+        _, value, quality = self.forward(
+            context_frames,
+            actions,
+            noisy_future=torch.zeros_like(context_frames[:,:Th]),  # dummy
+            timesteps=timesteps,
+        )
+        return value, quality
+
+
+
+
+########### VideoActionConditionedUNet Architecture ###################### 
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -2162,7 +2687,7 @@ class VideoWorldModelTrainer:
             fr = cv2.resize(fr, (W, H), interpolation=cv2.INTER_NEAREST)
             txt = f"r_gt={gt_rew[0, i]:.2f}  r_p={r_pred[0, i]:.2f}  q={q_pred[0, i]:.2f}"
             cv2.putText(fr, txt, (8, H-10), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                        (255,255,255), 1, cv2.LINE_AA)
+                        (155,155,155), 1, cv2.LINE_AA)
             out_bgr.append(fr[..., ::-1])        # BGR for OpenCV
     
         if gif_path is None:
@@ -2232,6 +2757,11 @@ if __name__ == "__main__":
     p.add_argument("--max_norm", type=float, default=1.0)
     p.add_argument("--min_snr_gamma", type=float, default=5.0,
                     help="γ in min-SNR loss weight (set ≤0 to disable)")
+
+    p.add_argument("--architecture", type=str, default="VideoActionConditionedUNet",
+                        choices=["VideoActionConditionedUNet", 
+                                 "RNNVideoActionConditionedUNet", 
+                                 "AccumVideoActionConditionedUNet"] )
     
     p.add_argument("--device",   type=str,  default="cuda:0")
     p.add_argument("--ckpt_dir", type=str,  default="./checkpoints_and_videos")
@@ -2248,14 +2778,43 @@ if __name__ == "__main__":
 
 
     # ─── model / trainer ─────────────────────────────────────────────
-    model = VideoActionConditionedUNet(
-        pred_horizon=args.pred_horizon,
-        context_frames=args.context_frames,
-        action_dim=2,
-        base_channels=args.base,
-        num_layers=args.layers,
-        num_heads=args.heads,
-        img_resolution=tuple(args.img_hw))   # <-- 96×96 from CLI
+
+    if args.architecture == "RNNVideoActionConditionedUNet":
+        
+        model = RNNVideoActionConditionedUNet(
+            pred_horizon=args.pred_horizon,
+            context_frames=args.context_frames,
+            action_dim=2,
+            base_channels=args.base,
+            num_layers=args.layers,
+            num_heads=args.heads,
+            img_resolution=tuple(args.img_hw))   # <-- 96×96 from CLI
+
+    elif args.architecture == "AccumVideoActionConditionedUNet":
+        
+        model = AccumVideoActionConditionedUNet(
+                pred_horizon=args.pred_horizon,
+                context_frames=args.context_frames,
+                action_dim=2,
+                base_channels=args.base,
+                num_layers=args.layers,
+                num_heads=args.heads,
+                img_resolution=tuple(args.img_hw))   # <-- 96×96 from CLI
+        
+    elif args.architecture == "VideoActionConditionedUNet":
+
+        model = VideoActionConditionedUNet(
+            pred_horizon=args.pred_horizon,
+            context_frames=args.context_frames,
+            action_dim=2,
+            base_channels=args.base,
+            num_layers=args.layers,
+            num_heads=args.heads,
+            img_resolution=tuple(args.img_hw))   # <-- 96×96 from CLI
+        
+    else:
+        raise Exception(f"No architecture implementation for: {args.architecture}")
+        
 
     
     
