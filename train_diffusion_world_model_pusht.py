@@ -1,28 +1,34 @@
-# train_diffusion_world_model_pusht.py
-# This file trains a diffusion world model on the pusht environment to take in (St,At) -> (St+1 = the next image after taking action At from St, Rt+1 = the reward of the predicted St+1)  
-# We use a U-Net with a cross attention layer At x St features. It will save off and overwrite checkpoints with a checkpoint config.txt with a unique id per run.
+# train_video_flow_world_model_pusht.py
+# This file trains a video flow world model on the pusht environment to take in (St,At) -> (St+1:t+n) = the next n images after taking action At from St, Rt+1:t+n = the rewards from the env of the predicted St+1:t+n)  
+# We use a U-Net with a cross attention layer At x St features. It will save off and overwrite checkpoints and gifs with a checkpoint config.txt with a unique id per run in an /all_runs/ folder. 
 
 # TO RUN:
 # Need to git clone https://github.com/real-stanford/diffusion_policy.git
 # then need to conda activate robodiff
 # then you can run this file with something like:
 
-# python train_diffusion_world_model_pusht.py \
-# --pred_horizon 16 \
-# --obs_horizon 2 \
-# --action_horizon 8 \
-# --max_steps_pusht_environment 200 \
-# --device cuda:1 \
-# --unet_num_layers 2 \
-# --base 64 \
-# --heads 4 \
-# --batch_size 32 \
-# --num_diffusion_iters_action_policy 1000 \
-# --beta_noise_start 1e-4 \
-# --beta_noise_end 0.02 \
-# --lr 0.0002 \
-# --batches_per_episode 50 \
-# --save_every 100
+# python train_video_flow_world_model_pusht.py \
+          # --base 32 \
+          # --layers 4 \
+          # --T 100 \
+          # --lr 0.0001 \
+          # --microbatch 16 \
+          # --macrobatch 4 \
+          # --random_policy_pct 0.1 \
+          # --device cuda:0 \
+          # --dataset_device cuda:0 \
+          # --ckpt_dir ./all_runs/ \
+          # --val_every 10 \
+          # --episodes 100000000 \
+          # --num_diffusion_iters_action_policy 100 \
+          # --action_horizon 8 \
+          # --context_frames 3 \
+          # --pred_horizon 16 \
+          # --max_steps_env 200 \
+          # --heads 4 \
+          # --beta0 1e-4 \
+          # --betaT 2e-2 \
+          # --img_hw 96 96 
 
 
 
@@ -30,6 +36,7 @@
 # diffusion policy imports
 
 from typing import Tuple, Sequence, Dict, Union, Optional, Callable
+import glob, re, json, os, sys
 import numpy as np
 import math
 import torch
@@ -37,6 +44,8 @@ import torch.nn as nn
 import torchvision
 import collections
 import zarr
+from datetime import datetime
+
 
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.training_utils import EMAModel
@@ -58,6 +67,8 @@ from skvideo.io import vwrite
 from IPython.display import Video
 import gdown
 import os
+from itertools import islice
+import imageio.v2 as imageio   # ← new import
 
 
 # **Environment**
@@ -317,6 +328,7 @@ class PushTEnv(gym.Env):
         self.reset_to_state = reset_to_state
 
     def reset(self):
+
         seed = self._seed
         self._setup()
         if self.block_cog is not None:
@@ -324,7 +336,27 @@ class PushTEnv(gym.Env):
         if self.damping is not None:
             self.space.damping = self.damping
 
-        # use legacy RandomState for compatiblity
+
+        # rs = np.random.RandomState(seed=seed)
+    
+        # # NEW: randomise goal BEFORE you randomise block/agent, or as you prefer
+        # self.goal_pose = np.array([
+        #     rs.randint( 50, 450),      # x
+        #     rs.randint( 50, 450),      # y
+        #     rs.uniform(-np.pi, np.pi)  # θ
+        # ])
+    
+        # # keep the existing randomisation for agent & block
+        # state = np.array([
+        #     rs.randint(50, 450), rs.randint(50, 450),
+        #     rs.randint(100, 400), rs.randint(100, 400),
+        #     rs.randn() * 2*np.pi - np.pi
+        # ])
+        # self._set_state(state)
+
+
+        
+        # OLD: use legacy RandomState for compatiblity
         state = self.reset_to_state
         if state is None:
             rs = np.random.RandomState(seed=seed)
@@ -680,21 +712,21 @@ class PushTImageEnv(PushTEnv):
 
 
 
-
 class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
 
-    def forward(self, x):
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
+    def forward(self, t):
+        """t: (B,) int32/float32 → (B, dim)"""
+        half = self.dim // 2
+        emb  = torch.exp(
+            -math.log(10000) *
+            torch.arange(half, device=t.device, dtype=torch.float32) /
+            (half - 1)
+        )
+        emb = t.float()[:, None] * emb[None, :]
+        return torch.cat([emb.sin(), emb.cos()], dim=1)
 
 class Downsample1d(nn.Module):
     def __init__(self, dim):
@@ -1122,7 +1154,7 @@ class SingleStatePushTEpisodicDataset(Dataset):
     # ──────────────────────────────── init ──────────────────────────────── #
     def __init__(
         self,
-        env_instance,
+        env,
         policy_net: Dict[str, torch.nn.Module],
         policy_scheduler,
         policy_config: Dict[str, Any],
@@ -1134,9 +1166,9 @@ class SingleStatePushTEpisodicDataset(Dataset):
 
         # ---------- store / move modules ---------------------------------- #
         self.device = torch.device(data_collection_device)
-        self.env = env_instance
+        self.env = env
         self.policy_net = {k: v.to(self.device).eval() for k, v in policy_net.items()}
-        self.scheduler = policy_scheduler
+        self.policy_scheduler = policy_scheduler
 
         # ---------- config ------------------------------------------------- #
         self.obs_horizon: int = policy_config["obs_horizon"]
@@ -1221,12 +1253,12 @@ class SingleStatePushTEpisodicDataset(Dataset):
     #     naction = torch.randn((1, self.pred_horizon, self.action_dim), device=self.device)
 
     #     # ---- denoising loop --------------------------------------------- #
-    #     self.scheduler.set_timesteps(self.num_diffusion_iters)
-    #     for t in self.scheduler.timesteps:
+    #     self.policy_scheduler.set_timesteps(self.num_diffusion_iters)
+    #     for t in self.policy_scheduler.timesteps:
     #         eps_pred = self.policy_net["noise_pred_net"](sample=naction,
     #                                                      timestep=t,
     #                                                      global_cond=obs_cond)
-    #         naction  = self.scheduler.step(model_output=eps_pred,
+    #         naction  = self.policy_scheduler.step(model_output=eps_pred,
     #                                        timestep=t,
     #                                        sample=naction).prev_sample
 
@@ -1236,7 +1268,7 @@ class SingleStatePushTEpisodicDataset(Dataset):
     @torch.no_grad()
     def _rollout(self, num_episodes: int) -> None:
 
-        
+        device = self.device
         for ep in range(num_episodes):
             obs, _ = self.env.reset()
             obs_deque = collections.deque([obs] * self.obs_horizon, maxlen=self.obs_horizon)
@@ -1261,7 +1293,7 @@ class SingleStatePushTEpisodicDataset(Dataset):
                         agent_poses = np.stack([x['agent_pos'] for x in obs_deque])
                 
                         # normalize observation
-                        nagent_poses = normalize_data(agent_poses, stats=stats['agent_pos'])
+                        nagent_poses = normalize_data(agent_poses, stats=self.stats['agent_pos'])
                         # nagent_poses = agent_poses
                         # images are already normalized to [0,1]
                         nimages = images
@@ -1275,7 +1307,7 @@ class SingleStatePushTEpisodicDataset(Dataset):
                         # infer action
                         with torch.no_grad():
                             # get image features
-                            image_features = ema_nets['vision_encoder'](nimages)
+                            image_features = self.policy_net['vision_encoder'](nimages)
                             # (2,512)
                 
                             # concat with low-dim observations
@@ -1286,22 +1318,22 @@ class SingleStatePushTEpisodicDataset(Dataset):
                 
                             # initialize action from Guassian noise
                             noisy_action = torch.randn(
-                                (1, pred_horizon, action_dim), device=device)
+                                (1, self.pred_horizon, self.action_dim), device=device)
                             naction = noisy_action
                 
                             # init scheduler
-                            noise_scheduler.set_timesteps(self.num_diffusion_iters)
+                            self.policy_scheduler.set_timesteps(self.num_diffusion_iters)
                 
-                            for k in noise_scheduler.timesteps:
+                            for k in self.policy_scheduler.timesteps:
                                 # predict noise
-                                noise_pred = ema_nets['noise_pred_net'](
+                                noise_pred = self.policy_net['noise_pred_net'](
                                     sample=naction,
                                     timestep=k,
                                     global_cond=obs_cond
                                 )
                 
                                 # inverse diffusion step (remove noise)
-                                naction = noise_scheduler.step(
+                                naction = self.policy_scheduler.step(
                                     model_output=noise_pred,
                                     timestep=k,
                                     sample=naction
@@ -1312,11 +1344,11 @@ class SingleStatePushTEpisodicDataset(Dataset):
                         # (B, pred_horizon, action_dim)
                         naction = naction[0]
                         # action_pred = naction
-                        action_pred = unnormalize_data(naction, stats=stats['action'])
+                        action_pred = unnormalize_data(naction, stats=self.stats['action'])
                 
                         # only take action_horizon number of actions
-                        start = obs_horizon - 1
-                        end = start + action_horizon
+                        start = self.obs_horizon - 1
+                        end = start + self.action_horizon
                         action = action_pred[start:end,:]
                         # (action_horizon, action_dim)
             
@@ -1328,7 +1360,7 @@ class SingleStatePushTEpisodicDataset(Dataset):
                         self._actions.append(action[i])
                         
                         # stepping env
-                        obs, reward, done, _, info = env.step(action[i])
+                        obs, reward, done, _, info = self.env.step(action[i])
                         # save observations
                         obs_deque.append(obs)
                         # and reward/vis
@@ -1489,333 +1521,1372 @@ class ActionConditionedUNet(nn.Module):
         return eps_pred, rew_pred
 
 
+
+
+
+
+########### RNNVideoActionConditionedUNet Architecture ###################### 
+import math, torch, torch.nn as nn, torch.nn.functional as F
+def conv_gnsilu(cin, cout, k=3, s=1, p=1):
+    return nn.Sequential(
+        nn.Conv3d(cin, cout, k, s, p),
+        nn.GroupNorm(8, cout),
+        nn.SiLU(),
+    )
+    
+class SinusoidalPosEmb_RNN(nn.Module):
+    """Standard sinusoidal embedding (for diffusion/flow-matching timesteps)."""
+    def __init__(self, dim): super().__init__(); self.dim = dim
+    def forward(self, t):                       # t: (B,)
+        half = self.dim // 2
+        freqs = torch.exp(
+            torch.arange(half, device=t.device) *
+            -(math.log(10000.0) / (half - 1))
+        )
+        emb = t.float().unsqueeze(1) * freqs.unsqueeze(0)     # (B, half)
+        return torch.cat([emb.sin(), emb.cos()], dim=-1)      # (B, dim)
+
+# ─────────────────── upgraded RNN UNet ──────────────────────
+class RNNVideoActionConditionedUNet(nn.Module):
+    """
+    Action-conditioned 3-D UNet **with GRU planner & FiLM**.
+
+    * Value / Quality heads come directly from GRU hidden states
+      (Linear → Transformer → 2-way Linear), so inference can bypass
+      the heavy decoder if only scalars are needed.
+
+    Public API unchanged from the original VideoActionConditionedUNet.
+    """
+
+    # ─────────────────────────────────────────────────────────
+    def __init__(self,
+                 pred_horizon,            # Th
+                 context_frames=3,        # Tc
+                 action_dim=2,            # D
+                 base_channels=8,         # C0
+                 num_layers=4,            # requested depth (≥3)
+                 num_heads=4,             # attn heads
+                 img_resolution=(96, 96),
+                 action_emb_dim=32):
+        super().__init__()
+
+        # ---------- hyper-params ----------
+        self.Th  = pred_horizon
+        self.Tc  = context_frames
+        self.D   = action_dim
+        self.dA  = action_emb_dim
+        self.H, self.W = img_resolution
+        assert self.H >= 8 and self.W >= 8, "Input resolution must be ≥ 8×8"
+
+        # ---------- action embed ----------
+        self.action_mlp = nn.Sequential(
+            nn.Linear(action_dim, action_emb_dim),
+            nn.SiLU(),
+            nn.Linear(action_emb_dim, action_emb_dim),
+        )
+
+        # ---------- timestep embed ----------
+        tdim = base_channels * 4
+        self.time_emb = nn.Sequential(
+            SinusoidalPosEmb_RNN(base_channels),
+            nn.Linear(base_channels, tdim),
+            nn.SiLU(),
+            nn.Linear(tdim, base_channels),
+        )
+
+        # ---------- stem ----------
+        in_C = 3 + action_emb_dim
+        self.stem = conv_gnsilu(in_C, base_channels)
+        ch = base_channels
+
+        # ---------- encoder (auto-stop at 8×8) ----------
+        self.down, self.pool, self.skip_ch = nn.ModuleList(), nn.ModuleList(), []
+        cur_h, cur_w = self.H, self.W
+        for _ in range(1, max(3, num_layers)):          # at least 3 downs
+            out_c = ch * 2
+            self.down.append(conv_gnsilu(ch, out_c))
+
+            # stride-2 only if next spatial ≥ 8×8
+            if min(cur_h // 2, cur_w // 2) >= 8:
+                k, s, p = (1,4,4), (1,2,2), (0,1,1)
+                cur_h //= 2; cur_w //= 2
+            else:
+                k, s, p = (1,3,3), (1,1,1), (0,1,1)
+            self.pool.append(nn.Conv3d(out_c, out_c, k, s, p))
+
+            self.skip_ch.append(out_c)
+            ch = out_c
+
+        # ---------- bottleneck ----------
+        self.bottleneck_conv = conv_gnsilu(ch, ch)
+
+        # GRU planner (batch_first=True → (B,T,*))
+        self.gru = nn.GRU(input_size = ch + action_emb_dim,
+                          hidden_size = ch,
+                          num_layers  = 1,
+                          batch_first = True)
+        self.film_fc = nn.Linear(ch, ch * 2)    # → γ, β
+
+        # ---------- deep value / quality heads ----------
+        red_dim = max(num_heads, (ch // 2 // num_heads) * num_heads)
+        self.deep_reduce = nn.Linear(ch, red_dim)
+        deep_tx_layer = nn.TransformerEncoderLayer(
+            d_model         = red_dim,
+            nhead           = num_heads,
+            dim_feedforward = red_dim * 4,
+            batch_first     = False)
+        self.deep_tx   = nn.TransformerEncoder(deep_tx_layer, num_layers=1)
+        self.deep_head = nn.Linear(red_dim, 2)           # → value, quality
+
+        # ---------- decoder ----------
+        self.up, self.up_t = nn.ModuleList(), nn.ModuleList()
+        for skip_c in reversed(self.skip_ch):
+            self.up_t.append(
+                nn.ConvTranspose3d(ch, skip_c,
+                                   (1,4,4), (1,2,2), (0,1,1)))
+            self.up.append(conv_gnsilu(skip_c * 2, skip_c))
+            ch = skip_c
+
+        self.up_t.append(
+            nn.ConvTranspose3d(ch, base_channels,
+                               (1,4,4), (1,2,2), (0,1,1)))
+        self.up.append(conv_gnsilu(base_channels * 2, base_channels))
+        ch = base_channels
+
+        # ---------- pixel head ----------
+        self.final_conv = nn.Conv3d(ch, 3, 3, 1, 1)
+        nn.init.zeros_(self.final_conv.bias)
+
+    # ────────────────────────── forward ─────────────────────────
+    def forward(self, context_frames, actions, noisy_future, timesteps):
+        """
+        context_frames : (B, Tc, 3, H, W)
+        actions        : (B, Th, D)      ← time-major
+        noisy_future   : (B, Th, 3, H, W)
+        timesteps      : (B,)
+        """
+        B, Tc, _, H, W = context_frames.shape
+        Th, dA = self.Th, self.dA
+        dev = context_frames.device
+
+        # ------ action embedding (B,Th,dA) ------
+        act_emb = self.action_mlp(actions)                 # (B,Th,dA)
+
+        # build volume (B,dA,Th,H,W)
+        act_vol = act_emb.transpose(1,2).unsqueeze(-1).unsqueeze(-1) \
+                         .expand(-1, -1, -1, H, W)
+
+        # ------ assemble input volume -----------
+        x = torch.zeros(B, 3 + dA, Tc + Th, H, W, device=dev)
+        x[:, :3, :Tc] = context_frames.permute(0,2,1,3,4)
+        x[:, :3, Tc:] = noisy_future.permute(0,2,1,3,4)
+        x[:, 3:, Tc:] = act_vol
+
+        # ------ time embedding ------------------
+        t_emb = self.time_emb(timesteps).view(B,-1,1,1,1)
+
+        # ------ stem ----------------------------
+        x = self.stem(x) + t_emb
+        stem_skip = x
+
+        # ------ encoder -------------------------
+        skips = []
+        for down, pool in zip(self.down, self.pool):
+            x = down(x); skips.append(x); x = pool(x)
+
+        # ------ bottleneck conv -----------------
+        x = self.bottleneck_conv(x)
+        if x.size(1) != t_emb.size(1):
+            t_big = t_emb.repeat(1, x.size(1)//t_emb.size(1),1,1,1)
+        else:
+            t_big = t_emb
+        x = x + t_big
+
+        # ------ GRU planner + FiLM --------------
+        B_, C_, T_, h, w = x.shape
+        vis_pool = x.mean((-2,-1)).transpose(1,2)            # (B,T,C)
+        ctx_pad  = torch.zeros(B_, self.Tc, dA, device=dev)
+        act_seq  = torch.cat([ctx_pad, act_emb], dim=1)       # (B,T,dA)
+        gru_in   = torch.cat([vis_pool, act_seq], dim=-1)     # (B,T,C+dA)
+        gru_out, _ = self.gru(gru_in)                         # (B,T,C)
+
+        gamma, beta = self.film_fc(gru_out).chunk(2, dim=-1)  # each (B,T,C)
+        gamma = gamma.transpose(1,2).unsqueeze(-1).unsqueeze(-1)
+        beta  = beta .transpose(1,2).unsqueeze(-1).unsqueeze(-1)
+        x = gamma * x + beta
+
+        # ===== deep heads (value / quality) =====
+        deep = self.deep_reduce(gru_out)                # (B,T,red_dim)
+        deep = deep.permute(1,0,2)                      # (T,B,red_dim) for Tx
+        deep = self.deep_tx(deep)                       # (T,B,red_dim)
+        deep = self.deep_head(deep).permute(1,0,2)      # (B,T,2)
+        value_pred   = deep[:, self.Tc:, 0]             # (B,Th)
+        quality_pred = deep[:, self.Tc:, 1]             # (B,Th)
+
+        # ------ decoder (pixel path) ------------
+        for up_t, blk in zip(self.up_t[:-1], self.up[:-1]):
+            x = up_t(x)
+            skip = skips.pop()
+            dh, dw = skip.shape[-2]-x.shape[-2], skip.shape[-1]-x.shape[-1]
+            if dh or dw:
+                x = F.pad(x,(dw//2, dw-dw//2, dh//2, dh-dh//2))
+            x = blk(torch.cat([x, skip], dim=1))
+
+        x = self.up_t[-1](x)
+        dh, dw = stem_skip.shape[-2]-x.shape[-2], stem_skip.shape[-1]-x.shape[-1]
+        if dh or dw:
+            x = F.pad(x,(dw//2, dw-dw//2, dh//2, dh-dh//2))
+        x = self.up[-1](torch.cat([x, stem_skip], dim=1))
+
+        eps = self.final_conv(x)[:, :, Tc:]              # (B,3,Th,H,W)
+        eps = eps.permute(0,2,1,3,4)                     # (B,Th,3,H,W)
+        return eps, value_pred, quality_pred
+
+    # -----------------------------------------------------------
+    @torch.no_grad()
+    def predict_value_quality(self, ctx_frames, actions, timesteps):
+        """Fast scalar inference (encoder + GRU only)."""
+        dummy_future = torch.zeros(
+            ctx_frames.size(0), self.Th, 3, self.H, self.W,
+            device=ctx_frames.device, dtype=ctx_frames.dtype)
+        _, v, q = self.forward(ctx_frames, actions, dummy_future, timesteps)
+        return v, q
+
+
+
+
+
+########### AccumVideoActionConditionedUNet Architecture ###################### 
+import math, torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SinusoidalPosEmb_Accum(nn.Module):
+    """1-D sinusoidal embedding for diffusion / flow-matching timesteps."""
+    def __init__(self, dim: int):
+        super().__init__(); self.dim = dim
+    def forward(self, t):                      # t: (B,) float / int
+        half = self.dim // 2
+        freqs = torch.exp(
+            torch.arange(half, device=t.device) *
+            -(math.log(10000.0) / (half - 1))
+        )
+        emb = t.float().unsqueeze(1) * freqs.unsqueeze(0)     # (B, half)
+        return torch.cat([emb.sin(), emb.cos()], dim=-1)      # (B, dim)
+
+# ───────────────────── main model ───────────────────────────
+class AccumVideoActionConditionedUNet(nn.Module):
+    """
+    Action-conditioned video UNet **with rolling-sum action channels**.
+    Value & Quality heads come *directly* from the bottleneck volume
+    (MLP → Transformer → MLP) so inference can skip the expensive decoder.
+
+    Args (unchanged from original VideoActionConditionedUNet)
+    ---------------------------------------------------------
+    pred_horizon    : int   # Th    (# future frames to predict)
+    context_frames  : int   # Tc    (# past frames given)
+    action_dim      : int   # D     (length of per-timestep action vector)
+    base_channels   : int   # C₀    (UNet width at full resolution)
+    num_layers      : int   # requested depth ≥3 (will be trimmed if spatial <8)
+    num_heads       : int   # attn heads in both Transformers
+    img_resolution  : (H,W)
+    action_emb_dim  : int   # learned embedding channels for each action step
+
+    Forward  (identical signature)
+    -------
+    (context_frames, actions, noisy_future, timesteps) →
+
+        eps        : (B, Th, 3, H, W)   — diffusion noise / flow residual
+        value_pred : (B, Th)            — scalar value per future step
+        qual_pred  : (B, Th)            — scalar “quality” per future step
+
+    Inference-time shortcut
+    -----------------------
+    ``value, quality = model.predict_value_quality(context_frames, actions, timesteps)``
+    runs only encoder + bottleneck (no decoder) for speed.
+    """
+    # ────────────────────────────────────────────────────────
+    def __init__(self,
+                 pred_horizon,
+                 context_frames=3,
+                 action_dim=2,
+                 base_channels=8,
+                 num_layers=4,
+                 num_heads=4,
+                 img_resolution=(96, 96),
+                 action_emb_dim=32):
+        super().__init__()
+        # ---------- params ----------
+        self.pred_horizon   = pred_horizon
+        self.context_frames = context_frames
+        self.action_dim     = action_dim
+        self.dA             = action_emb_dim
+        self.H, self.W      = img_resolution
+        assert self.H >= 8 and self.W >= 8, "Input resolution must be ≥ 8×8"
+
+        # ---------- action embedding (2·D → dA) ----------
+        self.action_mlp = nn.Sequential(
+            nn.Linear(2 * action_dim, action_emb_dim),
+            nn.SiLU(),
+            nn.Linear(action_emb_dim, action_emb_dim)
+        )
+
+        # ---------- timestep embedding ----------
+        t_dim = base_channels * 4
+        self.time_emb = nn.Sequential(
+            SinusoidalPosEmb_Accum(base_channels),
+            nn.Linear(base_channels, t_dim),
+            nn.SiLU(),
+            nn.Linear(t_dim, base_channels)
+        )
+
+        # ---------- stem ----------
+        in_C = 3 + action_emb_dim
+        self.stem = conv_gnsilu(in_C, base_channels)
+        ch = base_channels
+
+        # ---------- encoder (auto-stops at 8×8) ----------
+        self.down, self.pool, self.skip_ch = nn.ModuleList(), nn.ModuleList(), []
+        cur_h, cur_w = self.H, self.W
+        for _ in range(1, max(3, num_layers)):     # at least 3 downs
+            out_c = ch * 2
+            self.down.append(conv_gnsilu(ch, out_c))
+
+            # stride-2 only if next spatial ≥8, else stride-1
+            if min(cur_h // 2, cur_w // 2) >= 8:
+                stride, k, p = (1, 2, 2), (1, 4, 4), (0, 1, 1)
+                cur_h //= 2; cur_w //= 2
+            else:                                  # keep 8×8 or larger
+                stride, k, p = (1, 1, 1), (1, 3, 3), (0, 1, 1)
+
+            self.pool.append(nn.Conv3d(out_c, out_c, k, stride, p))
+            self.skip_ch.append(out_c)
+            ch = out_c
+
+
+
+        # AS PER PREVIOUS ARCH.. SHOULD PROB PUT INTO A FUNC.. TODO
+        # for _ in range(1, max(3, num_layers)):          # at least 3 downs
+        #     out_c = ch * 2
+        #     self.down.append(conv_gnsilu(ch, out_c))
+
+        #     # stride-2 only if next spatial ≥ 8×8
+        #     if min(cur_h // 2, cur_w // 2) >= 8:
+        #         k, s, p = (1,4,4), (1,2,2), (0,1,1)
+        #         cur_h //= 2; cur_w //= 2
+        #     else:
+        #         k, s, p = (1,3,3), (1,1,1), (0,1,1)
+        #     self.pool.append(nn.Conv3d(out_c, out_c, k, s, p))
+
+        #     self.skip_ch.append(out_c)
+        #     ch = out_c
+
+        # ---------- bottleneck ----------
+        self.bottleneck_conv = conv_gnsilu(ch, ch)
+        tx_layer = nn.TransformerEncoderLayer(
+            d_model          = ch,
+            nhead            = num_heads,
+            dim_feedforward  = ch * 4,
+            batch_first      = False)
+        self.transformer = nn.TransformerEncoder(tx_layer, num_layers=1)
+
+        # ── value / quality heads (from bottleneck) ──
+        red_dim = max(num_heads, (ch // 2 // num_heads) * num_heads)  # ensure ÷heads
+        self.deep_reduce = nn.Linear(ch, red_dim)
+        deep_tx_layer = nn.TransformerEncoderLayer(
+            d_model          = red_dim,
+            nhead            = num_heads,
+            dim_feedforward  = red_dim * 4,
+            batch_first      = False)
+        self.deep_tx   = nn.TransformerEncoder(deep_tx_layer, num_layers=1)
+        self.deep_head = nn.Linear(red_dim, 2)        # → value, quality
+
+        # ---------- decoder (unchanged) ----------
+        self.up, self.up_t = nn.ModuleList(), nn.ModuleList()
+        for skip_c in reversed(self.skip_ch):
+            self.up_t.append(
+                nn.ConvTranspose3d(ch, skip_c,
+                                   (1,4,4), (1,2,2), (0,1,1)))
+            self.up.append(conv_gnsilu(skip_c * 2, skip_c))
+            ch = skip_c
+
+        self.up_t.append(
+            nn.ConvTranspose3d(ch, base_channels,
+                               (1,4,4), (1,2,2), (0,1,1)))
+        self.up.append(conv_gnsilu(base_channels * 2, base_channels))
+        ch = base_channels
+
+        # ---------- pixel head ----------
+        self.final_conv = nn.Conv3d(ch, 3, 3, 1, 1)
+        nn.init.zeros_(self.final_conv.bias)
+
+    # ────────────────────────── forward ─────────────────────────
+    def forward(self, context_frames, actions, noisy_future, timesteps):
+    #     """
+    #     context_frames : (B, Tc, 3, H, W)
+    #     actions        : (B, D, Th)
+    #     noisy_future   : (B, Th, 3, H, W)
+    #     timesteps      : (B,)
+    #     """
+    #     B, Tc, _, H, W = context_frames.shape
+    #     Th, D, dA = self.pred_horizon, self.action_dim, self.dA
+    #     dev = context_frames.device
+
+    #     # ----- build augmented action tensor -----
+    #     actions_accum = torch.cumsum(actions, dim=2)           # (B,D,Th)
+    #     act_cat = torch.cat([actions, actions_accum], dim=1)   # (B,2D,Th)
+    #     act_emb = self.action_mlp(act_cat.permute(0, 2, 1))    # (B,Th,dA)
+
+    #     act_vol = act_emb.transpose(1, 2).unsqueeze(-1).unsqueeze(-1) \
+    #                       .expand(-1, -1, -1, H, W)            # (B,dA,Th,H,W)
+
+        B, Tc, _, H, W = context_frames.shape
+        Th, D, dA = self.pred_horizon, self.action_dim, self.dA
+        dev = context_frames.device
+    
+        # 1) rolling-sum over the *time* axis (=1)
+        actions_accum = torch.cumsum(actions, dim=1)          # (B,Th,D)
+    
+        # 2) concat along feature dim (=-1)  →  (B,Th,2D)
+        act_cat = torch.cat([actions, actions_accum], dim=-1) # (B,Th,2D)
+    
+        # 3) embed: (B,Th,2D) → (B,Th,dA)  (no permute needed)
+        act_emb = self.action_mlp(act_cat)
+    
+        # 4) build action volume  (B,dA,Th,H,W)
+        act_vol = act_emb.transpose(1, 2).unsqueeze(-1).unsqueeze(-1) \
+                         .expand(-1, -1, -1, H, W)
+
+        # ----- input volume -----
+        x = torch.zeros(B, 3 + dA, Tc + Th, H, W, device=dev)
+        x[:, :3, :Tc] = context_frames.permute(0, 2, 1, 3, 4)
+        x[:, :3, Tc:] = noisy_future.permute(0, 2, 1, 3, 4)
+        x[:, 3:, Tc:] = act_vol                                  # embed channels
+
+        # ----- time embedding -----
+        t_emb = self.time_emb(timesteps).view(B, -1, 1, 1, 1)
+
+        # ----- stem -----
+        x = self.stem(x) + t_emb
+        stem_skip = x
+
+        # ----- encoder -----
+        skips = []
+        for down, pool in zip(self.down, self.pool):
+            x = down(x); skips.append(x); x = pool(x)
+
+        # ----- bottleneck -----
+        x = self.bottleneck_conv(x)
+        if x.size(1) != t_emb.size(1):
+            t_big = t_emb.repeat(1, x.size(1) // t_emb.size(1), 1, 1, 1)
+        else:
+            t_big = t_emb
+        x = x + t_big
+
+        # time-only transformer (same as before)
+        B_, C_, T_, h, w = x.shape
+        seq = x.mean((-1, -2)).permute(2, 0, 1)       # (T,B,C)
+        seq = self.transformer(seq)
+        x   = x + seq.permute(1, 2, 0).unsqueeze(-1).unsqueeze(-1)
+
+        # ===== deep value / quality head =====
+        deep = x.mean((-1, -2)).permute(2, 0, 1)       # (T,B,C)
+        deep = self.deep_reduce(deep)                  # (T,B,red_dim)
+        deep = self.deep_tx(deep)                      # (T,B,red_dim)
+        deep = self.deep_head(deep)                    # (T,B,2)
+        deep = deep.permute(1, 0, 2)                   # (B,T,2)
+
+        value_pred   = deep[:, Tc:, 0]                 # (B,Th)
+        quality_pred = deep[:, Tc:, 1]                 # (B,Th)
+
+        # ----- decoder (pixel path) -----
+        for up_t, blk in zip(self.up_t[:-1], self.up[:-1]):
+            x = up_t(x)
+            skip = skips.pop()
+            dh, dw = skip.shape[-2] - x.shape[-2], skip.shape[-1] - x.shape[-1]
+            if dh or dw:
+                x = F.pad(x, (dw // 2, dw - dw // 2, dh // 2, dh - dh // 2))
+            x = blk(torch.cat([x, skip], dim=1))
+
+        x = self.up_t[-1](x)
+        dh, dw = stem_skip.shape[-2] - x.shape[-2], stem_skip.shape[-1] - x.shape[-1]
+        if dh or dw:
+            x = F.pad(x, (dw // 2, dw - dw // 2, dh // 2, dh - dh // 2))
+        x = self.up[-1](torch.cat([x, stem_skip], dim=1))
+
+        eps = self.final_conv(x)[:, :, Tc:]            # (B,3,Th,H,W)
+        eps = eps.permute(0, 2, 1, 3, 4)               # (B,Th,3,H,W)
+        return eps, value_pred, quality_pred
+
+    # -----------------------------------------------------------
+    @torch.no_grad()
+    def predict_value_quality(self, context_frames, actions, timesteps):
+        """
+        Faster inference helper: runs *only* encoder & bottleneck to
+        output value / quality, skipping the heavy decoder.
+        """
+        B, Tc, _, H, W = context_frames.shape
+        Th = self.pred_horizon
+        _, value, quality = self.forward(
+            context_frames,
+            actions,
+            noisy_future=torch.zeros_like(context_frames[:,:Th]),  # dummy
+            timesteps=timesteps,
+        )
+        return value, quality
+
+
+
+
+########### VideoActionConditionedUNet Architecture ###################### 
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class VideoActionConditionedUNet(nn.Module):
+    def __init__(self,
+                 pred_horizon,
+                 context_frames=3,
+                 action_dim=0,
+                 base_channels=64,
+                 num_layers=4,
+                 num_heads=4,
+                 img_resolution=(96, 96)):      # now default 96×96
+        super().__init__()
+        self.pred_horizon   = pred_horizon
+        self.context_frames = context_frames
+        self.action_dim     = action_dim
+
+        in_C = 3 + action_dim
+        self.stem = nn.Sequential(
+            nn.Conv3d(in_C, base_channels, 3, 1, 1),
+            nn.GroupNorm(8, base_channels),
+            nn.SiLU())
+
+        # ---------- time embedding ----------------------------------- #
+        t_dim = base_channels * 4
+        self.time_emb = nn.Sequential(
+            SinusoidalPosEmb(base_channels),
+            nn.Linear(base_channels, t_dim),
+            nn.SiLU(),
+            nn.Linear(t_dim, base_channels))
+
+        # ---------- encoder ------------------------------------------ #
+        enc_ch, ch = [], base_channels
+        self.down_convs, self.down_samples = nn.ModuleList(), nn.ModuleList()
+        for lvl in range(1, num_layers):
+            out_ch = base_channels * (2 ** lvl)
+            self.down_convs.append(nn.Sequential(
+                nn.Conv3d(ch, out_ch, 3, 1, 1),
+                nn.GroupNorm(8, out_ch),
+                nn.SiLU()))
+            self.down_samples.append(
+                nn.Conv3d(out_ch, out_ch,
+                          kernel_size=(1,4,4), stride=(1,2,2), padding=(0,1,1)))
+            enc_ch.append(out_ch)
+            ch = out_ch
+
+        self.bottleneck_conv = nn.Sequential(
+            nn.Conv3d(ch, ch, 3, 1, 1),
+            nn.GroupNorm(8, ch),
+            nn.SiLU())
+
+        tx_layer = nn.TransformerEncoderLayer(
+            d_model=ch, nhead=num_heads,
+            dim_feedforward=ch*4, batch_first=False)
+        self.transformer = nn.TransformerEncoder(tx_layer, 1)
+
+        # ---------- decoder ------------------------------------------ #
+        self.up_transpose, self.up_convs = nn.ModuleList(), nn.ModuleList()
+        curr_c = ch
+        for skip_c in reversed(enc_ch):
+            self.up_transpose.append(
+                nn.ConvTranspose3d(curr_c, skip_c,
+                                   (1,4,4), (1,2,2), (0,1,1)))
+            self.up_convs.append(nn.Sequential(
+                nn.Conv3d(skip_c*2, skip_c, 3, 1, 1),
+                nn.GroupNorm(8, skip_c),
+                nn.SiLU()))
+            curr_c = skip_c
+
+        # merge with stem
+        self.up_transpose.append(
+            nn.ConvTranspose3d(curr_c, base_channels,
+                               (1,4,4), (1,2,2), (0,1,1)))
+        self.up_convs.append(nn.Sequential(
+            nn.Conv3d(base_channels*2, base_channels, 3, 1, 1),
+            nn.GroupNorm(8, base_channels),
+            nn.SiLU()))
+        curr_c = base_channels
+
+        # ---------- heads -------------------------------------------- #
+        self.final_conv = nn.Conv3d(curr_c, 3, 3, 1, 1)
+        # nn.init.zeros_(self.final_conv.weight) # as is standard practice in diffusion
+        nn.init.normal_(self.final_conv.weight, std=0.1) # maybe better?
+        nn.init.zeros_(self.final_conv.bias) # as is standard practice in diffusion
+        self.reward_head  = nn.Linear(curr_c, 1)
+        self.quality_head = nn.Linear(curr_c, 1)
+        # self.noise_scale = nn.Parameter(torch.tensor(2.0))
+
+    # ───────────────────────────────────────────────────────────────────
+    #          FINAL forward – channel‑safe time embedding
+    # ───────────────────────────────────────────────────────────────────
+    def forward(self, context_frames, actions, noisy_future, timesteps):
+        """
+        context_frames : (B, Tc, 3, H, W)
+        actions        : (B, Th, A)
+        noisy_future   : (B, Th, 3, H, W)
+        timesteps      : (B,)  int64/float   diffusion step
+        returns        : eps_noise, reward_pred, quality_pred
+        """
+        B, Tc, _, H, W = context_frames.shape
+        Th, D = self.pred_horizon, self.action_dim
+        dev   = context_frames.device
+
+        # ---------- build input volume -------------------------------- #
+        x = torch.zeros(B, 3 + D, Tc + Th, H, W, device=dev)
+        x[:, :3, :Tc] = context_frames.permute(0, 2, 1, 3, 4)
+        x[:, :3, Tc:] = noisy_future.permute(0, 2, 1, 3, 4)
+        if D:
+            planes = actions[..., None, None].expand(-1, -1, -1, H, W)
+            x[:, 3:, Tc:] = planes.permute(0, 2, 1, 3, 4)
+
+        # ---------- prepare time embedding ---------------------------- #
+        t_emb = self.time_emb(timesteps)              # (B, base_C)
+        t_emb = t_emb[:, :, None, None, None]         # (B, base_C,1,1,1)
+
+        # ---------- stem --------------------------------------------- #
+        x = self.stem(x)                              # (B, base_C, ...)
+        x = x + t_emb                                 # ← safe (same width)
+        stem_skip = x
+
+        # ---------- encoder ------------------------------------------ #
+        skips = []
+        for conv, down in zip(self.down_convs, self.down_samples):
+            x = conv(x)
+            skips.append(x)
+            x = down(x)
+
+        # ---------- bottleneck --------------------------------------- #
+        x = self.bottleneck_conv(x)                   # (B, C, T, h, w)
+
+        # expand time‑emb channels if needed
+        if t_emb.shape[1] != x.shape[1]:
+            factor = x.shape[1] // t_emb.shape[1]
+            t_big  = t_emb.repeat(1, factor, 1, 1, 1)  # (B, C,1,1,1)
+        else:
+            t_big = t_emb
+        x = x + t_big                                 # second injection
+
+        # time‑only transformer
+        B, C, T, h, w = x.shape
+        seq = x.mean((-1,-2)).permute(2,0,1)          # (T,B,C)
+        seq = self.transformer(seq)
+        x   = x + seq.permute(1,2,0)[:, :, :,None,None]
+
+        # ---------- decoder ----------------------------------------- #
+        for tconv, merge in zip(self.up_transpose[:-1], self.up_convs[:-1]):
+            x = tconv(x)
+            skip = skips.pop()
+            dh, dw = skip.shape[-2]-x.shape[-2], skip.shape[-1]-x.shape[-1]
+            if dh or dw:
+                x = F.pad(x, (dw//2, dw-dw//2, dh//2, dh-dh//2))
+            x = merge(torch.cat([x, skip], dim=1))
+
+        x = self.up_transpose[-1](x)
+        dh, dw = stem_skip.shape[-2]-x.shape[-2], stem_skip.shape[-1]-x.shape[-1]
+        if dh or dw:
+            x = F.pad(x, (dw//2, dw-dw//2, dh//2, dh-dh//2))
+        x = self.up_convs[-1](torch.cat([x, stem_skip], dim=1))
+
+        # ---------- heads ------------------------------------------- #
+        eps = self.final_conv(x)[:, :, Tc:]            # (B,3,Th,H,W)
+        # eps = eps * self.noise_scale  # Scale outputs
+        eps = eps.permute(0, 2, 1, 3, 4)               # (B,Th,3,H,W)
+
+        feat = x[:, :, Tc:].mean((-1,-2)).permute(0, 2, 1)  # (B,Th,C)
+        reward_pred  = self.reward_head(feat).squeeze(-1)
+        quality_pred = self.quality_head(feat).squeeze(-1)
+
+        return eps, reward_pred, quality_pred
+
+
+
+
 import itertools, math, torch, torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 # STAGE 3: Write the DDPM style training loop code
 
-# ───────────────────── 3. Diffusion-style trainer ───────────────────────
-class DiffusionTrainer:
-    def __init__(self, model, num_diffusion_iters_worldmodel=100, beta_noise_start=1e-4, beta_noise_end=0.02, lr=2e-4, device="cuda"):
-        self.model  = model
-        self.opt    = torch.optim.AdamW(model.parameters(), lr=lr)
-        self.T      = num_diffusion_iters_worldmodel
-        self.device = device
-        self.beta_noise_start=beta_noise_start
-        self.beta_noise_end=beta_noise_end
-        self._init_noise_schedule()
+# # ───────────────────── 3. Diffusion-style trainer ───────────────────────
+# class DiffusionTrainer:
+#     def __init__(self, model, num_diffusion_iters_worldmodel=100, beta_noise_start=1e-4, beta_noise_end=0.02, lr=2e-4, device="cuda"):
+#         self.model  = model
+#         self.opt    = torch.optim.AdamW(model.parameters(), lr=lr)
+#         self.T      = num_diffusion_iters_worldmodel
+#         self.device = device
+#         self.beta_noise_start=beta_noise_start
+#         self.beta_noise_end=beta_noise_end
+#         self._init_noise_schedule()
 
-    def _init_noise_schedule(self):
-        beta  = torch.linspace(self.beta_noise_start, self.beta_noise_end, self.T, device=self.device)
-        alpha = 1 - beta
-        alphabar = torch.cumprod(alpha, 0)
-        self.sqrt_ab     = alphabar.sqrt()            # √α̅_t
-        self.sqrt_1mab   = (1 - alphabar).sqrt()      # √(1-α̅_t)
+#     def _init_noise_schedule(self):
+#         beta  = torch.linspace(self.beta_noise_start, self.beta_noise_end, self.T, device=self.device)
+#         alpha = 1 - beta
+#         alphabar = torch.cumprod(alpha, 0)
+#         self.sqrt_ab     = alphabar.sqrt()            # √α̅_t
+#         self.sqrt_1mab   = (1 - alphabar).sqrt()      # √(1-α̅_t)
 
-    @torch.no_grad()
-    def add_noise(self, x0, t):
-        ε = torch.randn_like(x0)
-        x_t = self.sqrt_ab[t][:, None, None, None] * x0 + \
-              self.sqrt_1mab[t][:, None, None, None] * ε
-        return x_t, ε
+#     @torch.no_grad()
+#     def add_noise(self, x0, t):
+#         ε = torch.randn_like(x0) 
+#         x_t = self.sqrt_ab[t][:, None, None, None, None] * x0 + \
+#               self.sqrt_1mab[t][:, None, None, None, None] * ε
+#         return x_t, ε
 
-    # ---------------------------------------------------------------
-    def train_epoch(self, loader, epoch):
-        self.model.train()
-        tot, tot_img, tot_rew = 0, 0, 0
-        N = len(loader.dataset)
+#     # ---------------------------------------------------------------
+#     def train_epoch(self, loader, epoch):
+#         self.model.train()
+#         tot, tot_img, tot_rew = 0, 0, 0
+#         N = len(loader.dataset)
 
-        step = 0
-        for img_t, act_t, img_tp1, rew_tp1 in loader:
-            step+=1
-            img_t   = img_t.to(self.device).float()
-            img_tp1 = img_tp1.to(self.device).float()
-            act_t   = act_t.to(self.device).float()
-            rew_tp1 = rew_tp1.to(self.device).float()
+#         step = 0
+#         for img_t, act_t, img_tp1, rew_tp1 in loader:
+#             step+=1
+#             img_t   = img_t.to(self.device).float()
+#             img_tp1 = img_tp1.to(self.device).float()
+#             act_t   = act_t.to(self.device).float()
+#             rew_tp1 = rew_tp1.to(self.device).float()
         
-            B   = img_tp1.size(0)
-            t   = torch.randint(0, self.T, (B,), device=self.device)
-            x_t, eps_gt = self.add_noise(img_tp1, t)
+#             B   = img_tp1.size(0)
+#             t   = torch.randint(0, self.T, (B,), device=self.device)
+#             x_t, eps_gt = self.add_noise(img_tp1, t)
         
-            eps_pred, r_pred = self.model(x_t, img_t, t, act_t)
+#             eps_pred, r_pred = self.model(x_t, img_t, t, act_t)
         
-            img_loss = F.mse_loss(eps_pred, eps_gt)
-            rew_loss = F.mse_loss(r_pred, rew_tp1)
-            loss     = img_loss + rew_loss
+#             img_loss = F.mse_loss(eps_pred, eps_gt)
+#             rew_loss = F.mse_loss(r_pred, rew_tp1)
+#             loss     = img_loss + rew_loss
 
-            self.opt.zero_grad()
-            loss.backward()
-            self.opt.step()
+#             self.opt.zero_grad()
+#             loss.backward()
+#             self.opt.step()
 
-            tot     += loss.item() * B
-            tot_img += img_loss.item() * B
-            tot_rew += rew_loss.item() * B
+#             tot     += loss.item() * B
+#             tot_img += img_loss.item() * B
+#             tot_rew += rew_loss.item() * B
 
-            if step % 20 == 0 or step == len(loader):
-                print(f"ep {epoch:03d}  step {step:03d}/{len(loader)}  "
-                      f"L {loss.item():.4f}  Img {img_loss.item():.4f}  "
-                      f"Rew {rew_loss.item():.4f}")
+#             if step % 20 == 0 or step == len(loader):
+#                 print(f"ep {epoch:03d}  step {step:03d}/{len(loader)}  "
+#                       f"L {loss.item():.4f}  Img {img_loss.item():.4f}  "
+#                       f"Rew {rew_loss.item():.4f}")
 
-        print(f"[epoch {epoch:03d}] mean losses  "
-              f"tot {tot/N:.6f} | img {tot_img/N:.6f} | rew {tot_rew/N:.6f}")
+#         print(f"[epoch {epoch:03d}] mean losses  "
+#               f"tot {tot/N:.6f} | img {tot_img/N:.6f} | rew {tot_rew/N:.6f}")
 
-
-
-import argparse
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train diffusion-based world model and action policy")
-
-    # Horizons and environment
-    parser.add_argument("--pred_horizon", type=int, default=16)
-    parser.add_argument("--obs_horizon", type=int, default=2)
-    parser.add_argument("--action_horizon", type=int, default=8)
-    parser.add_argument("--max_steps_pusht_environment", type=int, default=200)
-    parser.add_argument("--device", type=str, default="cuda:0")
-
-    # U-Net config
-    parser.add_argument("--unet_num_layers", type=int, default=2)
-    parser.add_argument("--base", type=int, default=64)
-    parser.add_argument("--heads", type=int, default=4)
-
-    # Training hyperparams
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--num_diffusion_iters_worldmodel", type=int, default=100, help="Set manually or match action policy")
-    parser.add_argument("--num_diffusion_iters_action_policy", type=int, default=100, help="Set manually or match world model")
-    parser.add_argument("--beta_noise_start", type=float, default=1e-4)
-    parser.add_argument("--beta_noise_end", type=float, default=0.02)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--batches_per_episode", type=int, default=50)
-    parser.add_argument("--save_every", type=int, default=100)
-
-    args = parser.parse_args()
-
-    # If not explicitly set, tie the iterations together
-    if args.num_diffusion_iters_worldmodel is None and args.num_diffusion_iters_action_policy is not None:
-        args.num_diffusion_iters_worldmodel = args.num_diffusion_iters_action_policy
-    elif args.num_diffusion_iters_action_policy is None and args.num_diffusion_iters_worldmodel is not None:
-        args.num_diffusion_iters_action_policy = args.num_diffusion_iters_worldmodel
-    elif args.num_diffusion_iters_worldmodel is None and args.num_diffusion_iters_action_policy is None:
-        raise ValueError("You must specify at least one of --num_diffusion_iters_worldmodel or --num_diffusion_iters_action_policy")
+# ──────────────────────────────────────────────────────────────────────────────
+# train_video_wm.py  (FULL main‑block rewrite)
+# ──────────────────────────────────────────────────────────────────────────────
+import os, math, json, argparse, random, cv2
+import numpy as np
+from tqdm.auto import tqdm
+import torch, torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from skvideo.io import vwrite
 
 
+# ─────────────────────────────────────────────────────────────────────
+# PushTVideoDataset   (self-contained — no external vars required)
+# ─────────────────────────────────────────────────────────────────────
+import collections, random, os
+from typing import Dict, Any, List, Tuple, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset
+
+# # ---------- helpers -------------------------------------------------
+# def normalize_data(arr: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarray:
+#     return (arr - stats["min"]) / (stats["max"] - stats["min"])
+
+# def unnormalize_data(arr: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarray:
+#     return arr * (stats["max"] - stats["min"]) + stats["min"]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PushTVideoDataset – roll-outs collected with a 100-episode pretrained policy
+# ─────────────────────────────────────────────────────────────────────────────
+class PushTVideoDataset(Dataset):
+    """
+    dataset = PushTVideoDataset(args)
+    dataset.collect_new_episodes(3)
 
-    for k, v in vars(args).items():
-        exec(f"{k} = {repr(v)}")
-        
-    # ### CONFIGS:
-    # pred_horizon = 16
-    # obs_horizon = 2
-    # action_horizon = 8
-    # max_steps_pusht_environment = 200
-    # device = "cuda:0"
-    
-    
-    # unet_num_layers = 2
-    # base = 64
-    # heads = 4
-    
-    # batch_size = 32
-    # num_diffusion_iters_worldmodel = num_diffusion_iters_action_policy
-    # lr = 2e-4
-    # batches_per_episode = 50          
-    # SAVE_EVERY = 100
+    Per-item return signatures
+        ctx_frames : (Tc,3,H,W)   float32 [0,1]
+        act_seq    : (Th,2)       *unnormalised* (env scale)
+        fut_frames : (Th,3,H,W)   float32 [0,1]
+        rew_seq    : (Th,)        float32
+    """
 
+    # ======================================================================
+    # constructor
+    # ======================================================================
+    def __init__(self, args, max_eps: int = 1_000):
+        super().__init__()
+        import os, gdown, torch, numpy as np, random, collections
+        from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
-    # ResNet18 has output dim of 512
-    vision_feature_dim = 512
-    # agent_pos is 2 dimensional
-    lowdim_obs_dim = 2
-    # action is delta x and delta y
-    action_dim = 2
-    
-    
-    arg_str = ','.join([f"{k}={v}" for k, v in vars(args).items()])
+        # ---------- keep args / env ----------------------------------------
+        self.args     = args
+        self.max_eps  = max_eps
+        self.env      = PushTImageEnv(render_size=args.img_hw[0])
 
-    randdd = str(np.random.rand())[-5:]
-    CKPT       = f"./checkpoint/model_{randdd}.ckpt"
+        # ---------- horizons (for the *dataset* / world-model) -------------
+        self.ctx        = args.context_frames      # context frames for WM
+        self.ph         = args.pred_horizon
+        self.ah         = args.action_horizon
+        self.max_steps  = args.max_steps_env
 
-    with open(f'./checkpoint/model_config_{randdd}.txt', 'w') as f:
-        f.write(arg_str)
+        # ---------- device -------------------------------------------------
+        self.device = torch.device(args.dataset_device)
 
-    print("CKPT name:",CKPT)
+        # ===================================================================
+        #                    ░░  P O L I C Y (pre-trained) ░░
+        # ===================================================================
+        self.use_policy = args.random_policy_pct < 1.0
+        if self.use_policy:
 
-    env_seed=42
+            # ---- fixed hyper-params that match pusht_vision_100ep.ckpt ----
+            self.policy_ctx  = 2                 # obs_horizon used in ckpt
+            vis_feat_dim     = 512
+            lowdim_obs_dim   = 2
+            action_dim       = 2
+            gcond_dim        = (vis_feat_dim + lowdim_obs_dim) * self.policy_ctx
+            t_embed_dim      = 256              # as in original DP
 
-    stats = {'agent_pos': 
-             {
-              'min': np.array([13.456424, 32.938293]),
-              'max': np.array([496.14618, 510.9579 ])
-             }, 
-             'action': 
-             {
-              'min': np.array([12., 25.]), 
-              'max': np.array([511., 511.])
-                       
-             }
+            # ---- networks --------------------------------------------------
+            vision_encoder = replace_bn_with_gn(get_resnet("resnet18"))
+            noise_pred_net = ConditionalUnet1D(
+                input_dim                = action_dim,
+                global_cond_dim          = gcond_dim,
+                diffusion_step_embed_dim = t_embed_dim,
+            )
+            self.policy_nets = torch.nn.ModuleDict({
+                "vision_encoder": vision_encoder,
+                "noise_pred_net": noise_pred_net,
+            }).to(self.device).eval()
+
+            # ---- DDPM scheduler for the policy ----------------------------
+            self.policy_scheduler = DDPMScheduler(
+                num_train_timesteps = args.num_diffusion_iters_action_policy,
+                beta_schedule       = "squaredcos_cap_v2",
+                clip_sample         = True,
+                prediction_type     = "epsilon",
+            )
+
+            # ---- normalisation stats (from DP repo) -----------------------
+            self.stats = {
+                "agent_pos": {"min": np.array([ 13.456424,  32.938293]),
+                              "max": np.array([496.146180, 510.957900])},
+                "action":    {"min": np.array([ 12.,  25.]),
+                              "max": np.array([511., 511.])},
             }
-    
-    
-    policy_config = dict(
-        obs_horizon=obs_horizon,
-        pred_horizon=pred_horizon,
-        action_horizon=action_horizon,
-        action_dim=action_dim,
-        num_diffusion_iters=num_diffusion_iters_action_policy,
-        stats=stats,                # the same dict you defined
-        max_steps=max_steps_pusht_environment,
-    )
-    
-    
-    #@markdown ### **Network Demo**
-    
-    # construct ResNet18 encoder
-    # if you have multiple camera views, use seperate encoder weights for each view.
-    vision_encoder = get_resnet('resnet18')
-    
-    # IMPORTANT!
-    # replace all BatchNorm with GroupNorm to work with EMA
-    # performance will tank if you forget to do this!
-    vision_encoder = replace_bn_with_gn(vision_encoder)
-    
-    # observation feature has 514 dims in total per step
-    obs_dim = vision_feature_dim + lowdim_obs_dim
-    
-    
-    # create network object
-    noise_pred_net = ConditionalUnet1D(
-        input_dim=action_dim,
-        global_cond_dim=obs_dim*obs_horizon
-    )
-    
-    # the final arch has 2 parts
-    nets = nn.ModuleDict({
-        'vision_encoder': vision_encoder,
-        'noise_pred_net': noise_pred_net
-    })
-    
-    
-    
-    # demo
-    with torch.no_grad():
-        # example inputs
-        image = torch.zeros((1, obs_horizon,3,96,96))
-        agent_pos = torch.zeros((1, obs_horizon, lowdim_obs_dim))
-        # vision encoder
-        image_features = nets['vision_encoder'](
-            image.flatten(end_dim=1))
-        # (2,512)
-        image_features = image_features.reshape(*image.shape[:2],-1)
-        # (1,2,512)
-        obs = torch.cat([image_features, agent_pos],dim=-1)
-        # (1,2,514)
-    
-        noised_action = torch.randn((1, pred_horizon, action_dim))
-        diffusion_iter = torch.zeros((1,))
-    
-        # the noise prediction network
-        # takes noisy action, diffusion iteration and observation as input
-        # predicts the noise added to action
-        noise = nets['noise_pred_net'](
-            sample=noised_action,
-            timestep=diffusion_iter,
-            global_cond=obs.flatten(start_dim=1))
-    
-        # illustration of removing noise
-        # the actual noise removal is performed by NoiseScheduler
-        # and is dependent on the diffusion noise schedule
-        denoised_action = noised_action - noise
-    
-    # for this demo, we use DDPMScheduler with 100 diffusion iterations
-    num_diffusion_iters_action_policy = 100
-    
-    
-    noise_scheduler = DDPMScheduler(
-        num_train_timesteps=num_diffusion_iters_action_policy,
-        # the choise of beta schedule has big impact on performance
-        # we found squared cosine works the best
-        beta_schedule='squaredcos_cap_v2',
-        # clip output to [-1,1] to improve stability
-        clip_sample=True,
-        # our network predicts noise (instead of denoised action)
-        prediction_type='epsilon'
-    )
-    
-    # device transfer
-    _ = nets.to(device)
-    
-    
-    load_pretrained = True
-    if load_pretrained:
-      ckpt_path = "pusht_vision_100ep.ckpt"
-      if not os.path.isfile(ckpt_path):
-          id = "1XKpfNSlwYMGaF5CncoFaLKCDTWoLAHf1&confirm=t"
-          gdown.download(id=id, output=ckpt_path, quiet=False)
-    
-      state_dict = torch.load(ckpt_path, map_location='cuda')
-      ema_nets = nets
-      ema_nets.load_state_dict(state_dict)
-      print('Pretrained weights loaded.')
-    else:
-      print("Skipped pretrained weight loading.")
-    
-    
-    
-    # 0. create env object
-    env = PushTImageEnv()
-    
-    # 1. seed env for initial state.
-    # Seed 0-200 are used for the demonstration dataset.
-    env.seed(env_seed)
-    
-    # 2. must reset before use
-    obs, info = env.reset()
-    
-    # Stage 3: Now lets test the train loop to overfit on one episode. SHOULD HIT 0 LOSS! 
-    
-    
-    
-    
-    os.makedirs(os.path.dirname(CKPT), exist_ok=True)
-    
-    
-    # device = "cuda" if torch.cuda.is_available() else "cpu"
-    model  = ActionConditionedUNet(img_c=3, 
-                                   base=base, 
-                                   act_dim=action_dim, 
-                                   num_layers=unet_num_layers, 
-                                   heads = heads).to(device)
-    
-    trainer = DiffusionTrainer(model, 
-                               num_diffusion_iters_worldmodel=num_diffusion_iters_worldmodel, 
-                               beta_noise_start=beta_noise_start, 
-                               beta_noise_end=beta_noise_end, 
-                               lr=lr, 
-                               device=device)
-    print(policy_config)
-    counterr=0
-    while True:
-        counterr+=1
-        dataset = SingleStatePushTEpisodicDataset(
-            env_instance=env,
-            policy_net=ema_nets,          # {'vision_encoder': ..., 'noise_pred_net': ...}
-            policy_scheduler=noise_scheduler,
-            policy_config=policy_config,
-            num_episodes=1,
-            random_policy_percentage=0.0, #set to 100% if you want a really bad policy.. and in between for in between.
-            data_collection_device=device,
-        )
-        for ep in range(1, batches_per_episode + 1):
-            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
-            trainer.train_epoch(loader, ep)
-        print("="*50)
-        print(counterr)
-        print(arg_str)
-        print("="*50)    
-        if counterr % save_every == 0 or counterr==1:
-            torch.save({"model_state": model.state_dict()},
-                       CKPT)
+
+            # ---- (optional) auto-download + load ckpt ---------------------
+            if args.load_pretrained:
+                ckpt_path = args.pretrained_ckpt                # default path
+                if not os.path.isfile(ckpt_path):
+                    print(f"[dataset] downloading pretrained policy → {ckpt_path}")
+                    FILE_ID = "1XKpfNSlwYMGaF5CncoFaLKCDTWoLAHf1"    # Google-drive id
+                    gdown.download(id=FILE_ID, output=ckpt_path, quiet=False)
+
+                if os.path.isfile(ckpt_path):
+                    state = torch.load(ckpt_path, map_location=self.device)
+                    self.policy_nets.load_state_dict(state, strict=False)
+                    print(f"[dataset] pretrained weights loaded from {ckpt_path}")
+                else:
+                    print(f"[dataset] WARNING: ckpt {ckpt_path} not found")
+
+            self.act_dim = action_dim  # for convenience
+        else:
+            # -------- pure random policy -----------------------------------
+            self.policy_nets      = None
+            self.policy_scheduler = None
+            self.stats            = None
+            self.act_dim          = self.env.action_space.shape[0]
+
+        # ---------- ε-greedy mixing ---------------------------------------
+        self.rand_pct = args.random_policy_pct
+        self.rng_py   = random.Random()
+        self.rng_np   = np.random.default_rng()
+
+        # ---------- storage -----------------------------------------------
+        self.episodes: list[dict] = []
+
+    # ======================================================================
+    # helpers
+    # ======================================================================
+    @torch.no_grad()
+    def _infer_policy(self, obs_deque: collections.deque) -> np.ndarray:
+        """
+        Run the pre-trained diffusion-policy for one *open-loop* sequence.
+        Uses exactly `self.policy_ctx` most recent observations to match ckpt.
+        Returns ndarray (pred_horizon,2) in **unnormalised** env scale.
+        """
+        imgs  = np.stack([o["image"]     for o in list(obs_deque)[-self.policy_ctx:]])
+        a_pos = np.stack([o["agent_pos"] for o in list(obs_deque)[-self.policy_ctx:]])
+
+        t_imgs = torch.from_numpy(imgs ).float().to(self.device)
+        t_apos = torch.from_numpy(
+            normalize_data(a_pos, self.stats["agent_pos"])
+        ).float().to(self.device)
+
+        feat  = self.policy_nets["vision_encoder"](t_imgs)                # (H,512)
+        obs   = torch.cat([feat, t_apos], dim=-1)                         # (H,514)
+        cond  = obs.unsqueeze(0).flatten(start_dim=1)                     # (1, H*514)
+
+        noisy = torch.randn((1, self.ph, self.act_dim), device=self.device)
+        self.policy_scheduler.set_timesteps(self.policy_scheduler.config.num_train_timesteps)
+        for k in self.policy_scheduler.timesteps:
+            eps   = self.policy_nets["noise_pred_net"](noisy, k, cond)
+            noisy = self.policy_scheduler.step(eps, k, noisy).prev_sample
+
+        act = noisy[0].cpu().numpy()                                      # normalised
+        return unnormalize_data(act, self.stats["action"])                # env scale
+
+    # ======================================================================
+    # public API
+    # ======================================================================
+    def collect_new_episodes(self, n_eps: int):
+        """Roll out `n_eps` new episodes and append them to internal buffer."""
+        for _ in range(n_eps):
+            self._rollout_one_episode()
+
+    def __len__(self):
+        return sum(ep["valid"] for ep in self.episodes)
+
+    def __getitem__(self, idx: int):
+        acc = 0
+        for ep in self.episodes:
+            if idx < acc + ep["valid"]:
+                start = idx - acc
+                imgs, acts, rews = ep["images"], ep["actions"], ep["rewards"]
+                break
+            acc += ep["valid"]
+        else:
+            raise IndexError
+
+        ctx  = imgs[start             : start+self.ctx]
+        fut  = imgs[start+self.ctx    : start+self.ctx+self.ph]
+        aseq = acts[start+self.ctx-1  : start+self.ctx-1+self.ph]
+        rseq = rews[start+self.ctx-1  : start+self.ctx-1+self.ph]
+
+        return (torch.from_numpy(ctx ).float(),
+                torch.from_numpy(aseq).float(),
+                torch.from_numpy(fut ).float(),
+                torch.from_numpy(rseq).float())
+
+    # ======================================================================
+    # episode rollout
+    # ======================================================================
+    def _rollout_one_episode(self):
+        import collections, numpy as np, torch
+        imgs, acts, rews = [], [], []
+
+        obs, _ = self.env.reset()
+        imgs.append(obs["image"])
+        buf = collections.deque([obs]*self.ctx, maxlen=self.ctx)
+
+        done, steps = False, 0
+        while (not done) and (steps < self.max_steps):
+
+            # ε-greedy action-sequence
+            use_rand = (not self.use_policy) or (self.rng_py.random() < self.rand_pct)
+            if use_rand:
+                low, high = self.env.action_space.low, self.env.action_space.high
+                act_seq = self.rng_np.uniform(low, high, (self.ah, self.act_dim)).astype(np.float32)
+            else:
+                act_seq = self._infer_policy(buf)[: self.ah]               # open-loop
+
+            # execute
+            for a in act_seq:
+                acts.append(a)
+                obs, rew, done, _, _ = self.env.step(a)
+                rews.append(rew)
+                imgs.append(obs["image"])
+                buf.append(obs)
+                steps += 1
+                if done or steps >= self.max_steps:
+                    break
+
+        # ---------- pack & keep only valid starting indices ----------------
+        imgs  = np.stack(imgs , axis=0)
+        acts  = np.stack(acts , axis=0)
+        rews  = np.stack(rews , axis=0)
+        valid = max(0, acts.shape[0] - (self.ctx + self.ph) + 1)
+
+        self.episodes.append(dict(images=imgs, actions=acts, rewards=rews, valid=valid))
+        if len(self.episodes) > self.max_eps:    # ring-buffer
+            old = self.episodes.pop(0); del old
+
+
+# ──────────────────────── trainer ────────────────────────────────────────────
+class VideoWorldModelTrainer:
+    def __init__(self, model, lr, T, beta_0, beta_T,
+                 device, ckpt_dir, pred_horizon, use_DDIM_scheduler=False, episode_start_counter=0):
+        self.model  = model.to(device)
+        self.opt    = torch.optim.AdamW(model.parameters(), lr=lr)
+        self.dev    = device
+        self.ckpt_d = ckpt_dir
+        os.makedirs(self.ckpt_d, exist_ok=True)
+        self.episode_start_counter = episode_start_counter
+
+        self.pred_horizon = pred_horizon
+
+        # pre‑compute √α̅ₜ and √(1‑α̅ₜ) for noise injection
+        betas        = torch.linspace(beta_0, beta_T, T, device=device)
+        alphas       = 1.0 - betas
+        self.ab      = torch.cumprod(alphas, 0)          # α̅ₜ
+        self.sqrt_ab = self.ab.sqrt()                    # √α̅ₜ
+        self.sqrt_1mab = (1.0 - self.ab).sqrt()          # √(1‑α̅ₜ)
+
+        self.T = T
+        self.use_ddim = use_DDIM_scheduler
+
+        # full DDPM scheduler for inference sampling
+        from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+        from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+
+        if not self.use_ddim:
+           
+            self.scheduler = DDPMScheduler(
+                num_train_timesteps=T,
+                beta_schedule="linear",
+                clip_sample=True,
+                prediction_type="epsilon")
+        else:
             
-            print(f"[counterr {counterr}] checkpoint saved → {CKPT}")
+            self.eta = 0.0  # Default to deterministic DDIM
+            self.scheduler = DDIMScheduler(
+                num_train_timesteps=T,
+                beta_schedule="linear",        # or "scaled_linear", "squaredcos_cap_v2", etc.
+                prediction_type="epsilon",     # "epsilon", "sample", or "v_prediction"
+                clip_sample=True,
+                set_alpha_to_one=False       
+            )
+
+
+
+
+
+    
+    # ------------------------------------------------------------------
+    def train(self, args, overfit=False):
+        """
+        One outer loop = one “episode” worth of new data collection.
+        The diffusion policy is built here (vision encoder + noise-UNet)
+        so that PushTVideoDataset can use it when random_policy_pct < 1.
+        """
+
+        dataset = PushTVideoDataset(args)
+        self.opt.zero_grad()
+
+        total_steps = 0
+        max_steps_per_collection = args.macrobatch * args.steps_per_episode_collection
+        # 2. outer loop --------------------------------
+        for ep_counter in range(self.episode_start_counter+1,100000000):
+
+            if not overfit or ep_counter==self.episode_start_counter+1:
+                # (re)collect one episode of data
+                dataset.collect_new_episodes(args.episodes)
+                loader = DataLoader(dataset, batch_size=args.microbatch,
+                                    shuffle=True, drop_last=True, pin_memory=True)
+
+            self.model.train()
+
+            for step, (ctx, acts, gt_fut, gt_rew) in enumerate(islice(loader, max_steps_per_collection), start=1):
+                B = ctx.size(0)
+                ctx, acts   = ctx.to(self.dev), acts.to(self.dev)
+                gt_fut, gt_rew = gt_fut.to(self.dev), gt_rew.to(self.dev)
+                ctx_orig = ctx.clone()
+                # print(f"1. gt_fut range (from DataLoader): [{gt_fut.min():.3f}, {gt_fut.max():.3f}]")
+                # print(f"3. ctx range (from DataLoader): [{ctx.min():.3f}, {ctx.max():.3f}]")
+
+                # Apply normalization
+                ctx = ctx * 2 - 1
+                gt_fut = gt_fut * 2 - 1
+                
+                # New flow matching data generation:
+                t_rand = torch.rand(B, device=self.dev)  # continuous time in [0,1]
+                # (Optionally scale to [0, T] if using sinusoidal embedding as before)
+                t_scaled = t_rand if self.T is None else t_rand * (self.T - 1)  
+                
+                # Sample a random noise video of same shape as gt_fut
+                noise = torch.randn_like(gt_fut)  # random Gaussian frames
+                
+                # Linearly interpolate between real data and noise at time t:
+                noisy_fut = (1 - t_rand.view(B,1,1,1,1)) * gt_fut + t_rand.view(B,1,1,1,1) * noise 
+                # noisy_fut is the interpolated video frames at time t
+
+                v_pred, r_pred, q_pred = self.model(ctx, acts, noisy_fut, t_scaled)
+                
+                v_target = noise - gt_fut   # shape (B, Th, 3, H, W)
+        
+                # loss_denoise = F.l1_loss(v_pred, noise)
+                # # loss_denoise = F.mse_loss(v_pred, noise)
+                
+                # loss_reward  = F.mse_loss(r_pred, gt_rew)
+                # qual_lbl     = sqrt_ab.squeeze().view(B,1).expand(-1, self.pred_horizon)
+                # loss_quality = F.mse_loss(q_pred, qual_lbl)
+
+                    
+
+                # ---------- weighted denoising loss --------------------------------
+                # diff = torch.abs(v_pred - v_target)     # or (v_pred - noise).pow(2) for MSE
+                # diff = (v_pred - v_target).pow(2)
+                # loss_denoise = (diff).mean()
+                # or
+                loss_denoise = F.mse_loss(v_pred, v_target)
+                      
+                # -------------------------------------------------------------------
+                
+                loss_reward  = F.mse_loss(r_pred, gt_rew)              # scalar
+                # qual_lbl     = sqrt_ab.squeeze().view(B,1).expand(-1, self.pred_horizon)
+                # loss_quality = F.mse_loss(q_pred, qual_lbl)            # scalar
+                qual_lbl = 0
+                loss_quality =  0
+                
+                loss = (loss_denoise + loss_reward + loss_quality ) / args.macrobatch
+                loss.backward()
+                
+                if step % args.macrobatch == 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.max_norm)
+
+                    self.opt.step()
+                    self.opt.zero_grad()   
+                    total_steps+=1
+
+                # if step % 1 == 0:
+                    print(f"Future frames range: [{gt_fut.min():.3f}, {gt_fut.max():.3f}]")
+                    print(f"Noise pred range: [{v_pred.min():.3f}, {v_pred.max():.3f}]")
+                    print(f"True noise range: [{noise.min():.3f}, {noise.max():.3f}]")
+
+                    time_now = datetime.now().strftime("%H:%M:%S")
+                    print(f"[t {time_now} | total {total_steps} | ep {ep_counter} | step {step}] L {loss:.4f} | denoise {loss_denoise:.4f} | rew {loss_reward:.4f} | q {loss_quality:.4f}")
+
+            # validation / checkpoint --------------------------------
+            if ep_counter % args.val_every == 0 and not overfit:
+                self.validate_with_gif(ctx_orig, acts, gt_rew, ep_counter, samplesteps=self.T)
+                # self.validate(ctx_orig, acts, gt_rew, ep_counter, samplesteps=self.T)
+
+                ckpt_path = os.path.join(self.ckpt_d, f"wm_ep{ep_counter:03d}.pt")
+                torch.save({"model": self.model.state_dict(),
+                            "opt":   self.opt.state_dict()}, ckpt_path)
+                print(f"[ep {ep_counter}] checkpoint saved → {ckpt_path}")
+
+
+    # ---------------------------------------------------------------------------------
+    # validate w/ gif  –  convert ctx back to [0,1] before calling _sample;
+    #                 write readable video frames
+    # ---------------------------------------------------------------------------------
+    def validate_with_gif(self, raw_ctx, acts, gt_rew, step,
+                      samplesteps=50, gif_path=None, fps=8):
+        """
+        raw_ctx is the context batch before multiplying by 2-1 in training
+        """
+        self.model.eval()
+        with torch.no_grad():
+            rgb_pred, r_pred, q_pred = self._sample(raw_ctx, acts, steps=samplesteps)
+    
+        frames = (rgb_pred[0].cpu().numpy() * 255).astype(np.uint8)      # (Th,3,H,W)
+        frames = frames.transpose(0, 2, 3, 1)                            # HWC
+    
+        out_bgr, H, W = [], 512, 512
+        for i, fr in enumerate(frames):
+            fr = cv2.resize(fr, (W, H), interpolation=cv2.INTER_NEAREST)
+            txt = f"r_gt={gt_rew[0, i]:.2f}  r_p={r_pred[0, i]:.2f}  q={q_pred[0, i]:.2f}"
+            cv2.putText(fr, txt, (8, H-10), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (155,155,155), 1, cv2.LINE_AA)
+            out_bgr.append(fr[..., ::-1])        # BGR for OpenCV
+    
+        if gif_path is None:
+            gif_path = os.path.join(self.ckpt_d, f"val_{step:07d}.gif")
+    
+        out_rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in out_bgr]
+        imageio.mimsave(gif_path, out_rgb, duration=1/fps, loop=0)
+        print(f"[validate] GIF saved → {gif_path}")
+
+    # ---------------------------------------------------------------------------------
+    # _sample  –  fully normalise ctx/acts, start from correct x_T, and
+    #                 run full-length sampling (scheduler.num_inference_steps)
+    # ---------------------------------------------------------------------------------
+    @torch.no_grad()
+    def _sample(self, ctx, acts, steps: int = 50):
+        """
+        ctx  : (B,Tc,3,H,W) in [0,1]
+        acts : (B,Th,A)     un-normalised
+        returns rgb_pred ∈ [0,1], r_pred  (reward sequence)
+        """
+        B, Tc, _, H, W = ctx.shape
+        ctx = ctx * 2 - 1                         # normalise like training
+    
+        # start from pure noise at t=1
+        x = torch.randn(B, self.pred_horizon, 3, H, W, device=self.dev)
+        dt = 1.0 / steps
+    
+        r_pred = None
+        for i in range(steps):
+            t_curr = 1.0 - i * dt                # integrate 1 → 0
+            t_tensor = torch.full((B,), t_curr * (self.T - 1), device=self.dev)
+            v, r_pred, q_pred = self.model(ctx, acts, x, t_tensor)  # velocity
+            x = x - v * dt                       # reverse-Euler step
+    
+        x = x.clamp(-1, 1)
+        rgb = (x + 1) / 2                        # back to [0,1]
+        return rgb, r_pred, q_pred
+
+
+
+# ───────────────────────────── main ──────────────────────────────────────────
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    # ─── env / horizon ────────────────────────────────────────────────
+    p.add_argument("--pred_horizon",  type=int, default=16)
+    p.add_argument("--action_horizon",  type=int, default=8)
+    p.add_argument("--context_frames",type=int, default=3)
+    p.add_argument("--max_steps_env", type=int, default=300)
+    # ─── model ────────────────────────────────────────────────────────
+    p.add_argument("--base",     type=int, default=64)
+    p.add_argument("--layers",   type=int, default=4)
+    p.add_argument("--heads",    type=int, default=4)
+    p.add_argument("--img_hw",   type=int, nargs=2, default=[96,96])
+    # ─── diffusion ────────────────────────────────────────────────────
+    p.add_argument("--T",        type=int, default=1000)
+    p.add_argument("--beta0",    type=float, default=1e-4)
+    p.add_argument("--betaT",    type=float, default=2e-2)
+    # ─── train ────────────────────────────────────────────────────────
+    p.add_argument("--microbatch",    type=int, default=16)
+    p.add_argument("--macrobatch",    type=int, default=1)
+    p.add_argument("--lr",       type=float, default=5e-4)
+    p.add_argument("--epochs",   type=int, default=10)
+    p.add_argument("--val_every",type=int, default=10)
+    p.add_argument("--episodes",type=int, default=1)
+    p.add_argument("--steps_per_episode_collection",type=int, default=100)
+    p.add_argument("--num_diffusion_iters_action_policy",type=int, default=100)
+    p.add_argument("--max_norm", type=float, default=1.0)
+    p.add_argument("--min_snr_gamma", type=float, default=5.0,
+                    help="γ in min-SNR loss weight (set ≤0 to disable)")
+
+    p.add_argument("--architecture", type=str, default="VideoActionConditionedUNet",
+                        choices=["VideoActionConditionedUNet", 
+                                 "RNNVideoActionConditionedUNet", 
+                                 "AccumVideoActionConditionedUNet"] )
+    
+    p.add_argument("--device",   type=str,  default="cuda:0")
+    p.add_argument("--ckpt_dir", type=str,  default="./checkpoints_and_videos")
+
+    p.add_argument("--random_policy_pct", type=float, default=0.3,
+               help="0 ⇒ purely policy‑guided, 1 ⇒ purely random, 0.3 ⇒ 30 % random")
+    p.add_argument("--dataset_device", type=str, default="cuda:0",
+               help="GPU on which to run the diffusion policy during collection")
+    p.add_argument("--load_pretrained", action="store_true", default=True,
+               help="If True, automatically download & load the 100-episode "
+                    "Diffusion-Policy checkpoint for Push-T.")
+    p.add_argument("--pretrained_ckpt", type=str,
+               default="pusht_vision_100ep.ckpt",
+               help="Local path to the .pt checkpoint. "
+                    "If it does not exist it will be downloaded via gdown.")
+
+
+
+    args = p.parse_args()
+    print(args)
+
+
+    # ─── model / trainer ─────────────────────────────────────────────
+
+    if args.architecture == "RNNVideoActionConditionedUNet":
+        
+        model = RNNVideoActionConditionedUNet(
+            pred_horizon=args.pred_horizon,
+            context_frames=args.context_frames,
+            action_dim=2,
+            base_channels=args.base,
+            num_layers=args.layers,
+            num_heads=args.heads,
+            img_resolution=tuple(args.img_hw))   # <-- 96×96 from CLI
+
+    elif args.architecture == "AccumVideoActionConditionedUNet":
+        
+        model = AccumVideoActionConditionedUNet(
+                pred_horizon=args.pred_horizon,
+                context_frames=args.context_frames,
+                action_dim=2,
+                base_channels=args.base,
+                num_layers=args.layers,
+                num_heads=args.heads,
+                img_resolution=tuple(args.img_hw))   # <-- 96×96 from CLI
+        
+    elif args.architecture == "VideoActionConditionedUNet":
+
+        model = VideoActionConditionedUNet(
+            pred_horizon=args.pred_horizon,
+            context_frames=args.context_frames,
+            action_dim=2,
+            base_channels=args.base,
+            num_layers=args.layers,
+            num_heads=args.heads,
+            img_resolution=tuple(args.img_hw))   # <-- 96×96 from CLI
+        
+    else:
+        raise Exception(f"No architecture implementation for: {args.architecture}")
+        
+
+    
+    
+    # ─── check for prev checkpoint ───────────────────────────────────────────────
+    ckpt_re   = re.compile(r"wm_ep(\d+)\.pt$")
+    latest_ckpt = None
+    last_ep      = -1
+    
+    if os.path.isdir(args.ckpt_dir):
+        for p in glob.glob(os.path.join(args.ckpt_dir, "wm_ep*.pt")):
+            m = ckpt_re.search(os.path.basename(p))
+            if m:
+                ep = int(m.group(1))
+                if ep > last_ep:
+                    last_ep, latest_ckpt = ep, p
+    
+    if latest_ckpt is not None:
+        # ── resume ──────────────────────────────────────────────────────────
+        print(f"\n\033[92m▶ Resuming from {latest_ckpt} "
+              f"(episode {last_ep})\033[0m\n", file=sys.stderr)
+    
+        state = torch.load(latest_ckpt, map_location="cpu")
+        model.load_state_dict(state["model"], strict=False)      # restore weights
+        # resume_opt_state = state.get("opt", None)                # may be used later
+        del state
+        episode_start_counter = last_ep + 1
+    else:
+        # ── fresh run ───────────────────────────────────────────────────────
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+        with open(os.path.join(args.ckpt_dir, "hparams.json"), "w") as f:
+            json.dump(vars(args), f, indent=2)
+        resume_opt_state      = None
+        episode_start_counter = 0
+
+
+
+    trainer = VideoWorldModelTrainer(
+        model, args.lr, args.T, args.beta0, args.betaT,
+        args.device, args.ckpt_dir,
+        pred_horizon=args.pred_horizon, 
+        episode_start_counter=episode_start_counter)
+
+    # ─── run ─────────────────────────────────────────────────────────
+    trainer.train(args)
+
+
